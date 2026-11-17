@@ -244,6 +244,16 @@
     </div>
   </dialog>
 
+  <section class="step" id="cgx-v02-panel" style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px">
+    <h2>V0.2 · Edge 自动采集（测试版）</h2>
+    <label class="option">
+      <input id="cgx-v02-enabled" type="checkbox" disabled>
+      <span>每日北京时间 23:45 增量导出（默认关闭）</span>
+    </label>
+    <p id="cgx-v02-status" class="hint" role="status">正在检查历史基线…</p>
+    <p class="hint">不会删除对话；新扩展必须先迁移并核验旧增量索引，避免重复下载完整历史。</p>
+  </section>
+
   <footer>
     <button id="download-failures" type="button" hidden>Download failure log</button>
     <button id="download-log" type="button" hidden>Download diagnostic log</button>
