@@ -744,7 +744,9 @@ async function cgxV02InitUI() {
   const baselineFile = $("cgx-v02-baseline-file");
   const aliasFile = $("cgx-v02-alias-file");
   const importResult = $("cgx-v02-import-result");
-  if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !aliasFile || !importResult) return;
+  const previewButton = $("cgx-v02-preview-button");
+  const previewResult = $("cgx-v02-preview-result");
+  if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !aliasFile || !importResult || !previewButton || !previewResult) return;
   let baselineReady = false;
   function canImport() {
     return !baselineReady && !!(sourceFile.files?.length && baselineFile.files?.length && !enabled.checked);
@@ -754,6 +756,7 @@ async function cgxV02InitUI() {
     enabled.checked = !!state.enabled;
     baselineReady = !!data.indexReady;
     enabled.disabled = !data.indexReady;
+    previewButton.disabled = !data.indexReady;
     importButton.disabled = !canImport();
     if (!data.indexReady) {
       info.textContent = "旧版增量索引尚未通过核对。自动采集已锁定，避免重新下载全部历史。";
@@ -790,6 +793,23 @@ async function cgxV02InitUI() {
   function updateImportButton() {
     importButton.disabled = !canImport();
   }
+  previewButton.addEventListener("click", async () => {
+    previewButton.disabled = true;
+    previewResult.textContent = "正在只读扫描；不会生成或下载 ZIP…";
+    try {
+      const result = await api.runtime.sendMessage({type:"cgx-v02-preview-now"});
+      if(!result?.ok) throw new Error(result?.error || "预检失败");
+      previewResult.textContent =
+        "扫描 " + result.listed + " 条，新增 " + result.newCount +
+        " 条，修改 " + result.modified + " 条；" +
+        (result.safeToTest ? "低于测试保护上限，可进入受控验收。"
+          : "超出保护上限 " + result.maxPilotDelta + " 条，禁止自动导出。");
+    } catch (e) {
+      previewResult.textContent = "预检未通过，不会下载：" + String(e?.message || e);
+    }
+    await refresh();
+  });
+
   sourceFile.addEventListener("change", updateImportButton);
   baselineFile.addEventListener("change", updateImportButton);
   aliasFile.addEventListener("change", updateImportButton);
