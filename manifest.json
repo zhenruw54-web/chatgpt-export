@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT Markdown Export",
-  "version": "0.6.59",
+  "name": "ChatGPT Export V0.2 TEST",
+  "version": "0.6.59.2",
   "description": "Export ChatGPT conversations to Markdown, HTML, JEX, or ZIP, with images, files, and sources.",
   "homepage_url": "https://github.com/thekester/chatgpt-export",
   "icons": {
@@ -57,6 +57,7 @@
   },
   "permissions": [
     "storage",
-    "scripting"
+    "scripting",
+    "alarms"
   ]
 }
