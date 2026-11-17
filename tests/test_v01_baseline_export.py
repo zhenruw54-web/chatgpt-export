@@ -110,6 +110,16 @@ class V01BaselineExportTests(unittest.TestCase):
         with self.assertRaisesRegex(exporter.BaselineError, "absent"):
             exporter.verify_baseline(self.db)
 
+    def test_readonly_connection_is_closed_before_return(self):
+        # On Windows, renaming an open SQLite database typically raises
+        # PermissionError / WinError 32. This test uses ONLY synthetic files.
+        result = exporter.verify_baseline(self.db)
+        self.assertEqual(len(result["conversation_ids"]), 65)
+        renamed = self.dir / "state-renamed.sqlite3"
+        self.db.rename(renamed)
+        renamed.rename(self.db)
+        self.assertTrue(self.db.is_file())
+
     def test_read_only_never_creates_database(self):
         missing = self.dir / "nonexistent.sqlite3"
         with self.assertRaises(exporter.BaselineError):
