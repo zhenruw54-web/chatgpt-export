@@ -36,6 +36,7 @@ function sandbox({registered={ok:true,token:"token-1"},
     calls.push("message:"+msg.type);
     if(msg.type==="cgx-v02-watch-zip")return registered;
     if(msg.type==="cgx-v02-await-zip")return receipt;
+    if(msg.type==="cgx-v02-abort-zip")return {ok:true};
     throw Error("Unexpected message type");
   }}};
   const document={
@@ -76,6 +77,13 @@ async function main(){
   await assert.rejects(interrupted.fn("chatgpt-export_2026-11-17_14-00-00.zip",
     new Blob([new Uint8Array(1024)])),/interrupted/i);
   check("Interrupted download blocks scheduled success",true);
+  check("Failed download releases observer",
+    interrupted.calls.includes("message:cgx-v02-abort-zip"));
+  const deniedClick=sandbox({clickError:new Error("click blocked")});
+  await assert.rejects(deniedClick.fn("chatgpt-export_2026-11-17_14-00-00.zip",
+    new Blob([new Uint8Array(1024)])),/click blocked/);
+  check("Failed anchor click releases observer",
+    deniedClick.calls.includes("message:cgx-v02-abort-zip"));
   const timeout=sandbox({receipt:{ok:false,error:"Timeout; index unchanged"}});
   await assert.rejects(timeout.fn("chatgpt-export_2026-11-17_14-00-00.zip",
     new Blob([new Uint8Array(1024)])),/Timeout/i);
