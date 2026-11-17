@@ -1237,6 +1237,36 @@
     checkCancelled();download(`chatgpt-export_${stamp}${suffix}.zip`,CGX_buildZip(files));
   }
 
+  // Read-only metadata preview. No ZIP, no index writes, no IDs in result.
+  async function cgxV02PreviewDelta(){
+    checkCancelled();
+    const previousIndex=await storageGet('cgx-export-index');
+    if(!previousIndex||typeof previousIndex!=='object'||Array.isArray(previousIndex)||
+        Object.keys(previousIndex).length<65)
+      throw new Error('Incremental baseline missing. No preview/export started.');
+    const listed=await listAll({conversationLimit:0,since:null},
+      label=>progressPercent(1,label));
+    if(!listed||!Array.isArray(listed.items)||listed.items.length===0)
+      throw new Error('History listing empty or unavailable; refusing automatic export.');
+    let changed=0,newCount=0,modified=0;
+    for(const item of listed.items){
+      checkCancelled();
+      const id=item.conversation_id||item.id;
+      if(!id)throw new Error('History item lacks an identifier.');
+      const key=`${item._cgxAccountId||'personal'}:${id}`;
+      const fingerprint=await sha256Hex(JSON.stringify([
+        item.update_time||item.create_time||null,item.title||'',
+        !!item._cgxArchived,item._cgxProjectId||null,item._cgxShareId||null
+      ]));
+      if(!previousIndex[key]){
+        changed++;newCount++;
+      }else if(previousIndex[key].fingerprint!==fingerprint){
+        changed++;modified++;
+      }
+    }
+    return{listed:listed.items.length,changed,newCount,modified,
+      baselineEntries:Object.keys(previousIndex).length};
+  }
   async function exportAll(opts, preparedList=null){
     progressPercent(1,'Searching account history…');
     const last=opts.incremental?await storageGet('cgx-last-full-export'):null;
@@ -1290,7 +1320,11 @@
     checkCancelled();
     progressPercent(100,'Finalizing archive…',items.length,items.length);await flush(true);
     progressPercent(100,'Saving export state…',items.length,items.length);
-    await storageSet({'cgx-export-index':nextIndex,'cgx-last-full-export':Date.now()});
+    // Scheduled storage errors must not be swallowed.
+    // This is NOT proof of a durable Windows ZIP download.
+    if(opts.v02Scheduled)
+      await api.storage.local.set({'cgx-export-index':nextIndex,'cgx-last-full-export':Date.now()});
+    else await storageSet({'cgx-export-index':nextIndex,'cgx-last-full-export':Date.now()});
     progressPercent(100,'Export ready.',items.length,items.length);
     return{count:items.length-totalErrors,failed:totalErrors,failedIds,imageFailures:totalImageFailures,fileFailures:totalFileFailures,parts,exportedItems:succeededItems(items,failedIds),projectDeletionCandidates:listed.projectDeletionCandidates||[]};
   }
@@ -1531,6 +1565,7 @@
     }
     if(msg.type==='cgx-ping'){const t=currentTarget();storageGet('cgx-last-full-export').then(last=>sendResponse({ok:true,busy,hasConversation:!!t,lastExport:last||null,progress:progressState,activity:activityState,failures:liveFailureDetails,lastJob:lastExportState}));return true;}
     if(msg.type==='cgx-manager-list')return withBusyJob(sendResponse,'conversation list',managerList);
+    if(msg.type==='cgx-v02-preview')return withBusyJob(sendResponse,'scheduled delta preview',cgxV02PreviewDelta);
     if(msg.type==='cgx-manager-run')return withBusyJob(sendResponse,'selected conversation actions',()=>managerRun(msg));
     if(msg.type!=='cgx-export-current'&&msg.type!=='cgx-export-all'&&msg.type!=='cgx-v02-auto-export')return false;
     if(busy){sendResponse({ok:false,error:'An export is already running in this tab.',diagnostics:diagnosticSnapshot({error:{message:'Export already running.'}})});return false;}
