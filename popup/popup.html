@@ -253,6 +253,28 @@
     <p id="cgx-v02-status" class="hint" role="status">正在检查历史基线…</p>
     <button id="cgx-v02-preview-button" type="button" disabled style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px">只读预检增量（不会下载）</button>
     <p id="cgx-v02-preview-result" class="hint" role="status"></p>
+    <details id="cgx-v02-pilot" style="margin-top:8px">
+      <summary>单条对话受控验收</summary>
+      <div class="group">
+        <p class="hint">仅用于一条明确的新测试对话。每日自动采集必须保持关闭。</p>
+        <label class="number-row" style="display:block;margin-top:10px">
+          Conversation ID
+          <input id="cgx-v02-pilot-conversation" type="text" autocomplete="off" spellcheck="false" style="width:100%;margin-top:4px">
+        </label>
+        <label class="number-row" style="display:block">
+          Workspace ID
+          <input id="cgx-v02-pilot-workspace" type="text" autocomplete="off" spellcheck="false" style="width:100%;margin-top:4px">
+        </label>
+        <button id="cgx-v02-pilot-prepare" type="button" disabled style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px">核对单条目标（不会下载）</button>
+        <button id="cgx-v02-pilot-start" type="button" disabled style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;margin-top:6px">下载已核对的单条测试 ZIP</button>
+        <p id="cgx-v02-pilot-result" class="hint" role="status"></p>
+        <label class="number-row" style="display:block">
+          V0.1 本地接收验收回执
+          <input id="cgx-v02-pilot-receipt" type="file" accept=".json,application/json" style="width:100%;margin-top:4px">
+        </label>
+        <button id="cgx-v02-pilot-finalize" type="button" disabled style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px">核对回执并提交这一条索引</button>
+      </div>
+    </details>
     <p class="hint">不会删除对话；新扩展必须先迁移并核验旧增量索引，避免重复下载完整历史。</p>
     <details id="cgx-v02-migration" style="margin-top:8px">
       <summary>一次性迁移旧扩展索引（本地操作）</summary>

@@ -184,6 +184,9 @@ const CGX_V02_ALARM = "cgx-v02-daily-2345-beijing";
 const CGX_V02_TIMEZONE = "Asia/Shanghai";
 const CGX_V02_RETRY_GUARD_MS = 60 * 60 * 1000;
 const CGX_V02_RECEIPT_KEY = "cgx-v02-index-migration";
+const CGX_V02_PILOT_GATE_KEY = "cgx-v02-pilot-gate-v1";
+const CGX_V02_PILOT_PENDING_KEY = "cgx-v02-pilot-pending-v1";
+const CGX_V02_PILOT_GATE_TTL_MS = 10 * 60 * 1000;
 const CGX_V02_EXPECTED_BASELINE_COUNT = 65;
 const CGX_V02_MAX_TRANSFER_CHARS = 512 * 1024;
 // Conservative pilot cap: a mass metadata mismatch must never trigger full re-export.
@@ -202,10 +205,13 @@ function cgxV02NextBeijing2345(afterMs) {
 }
 
 async function cgxV02Read() {
-  const result = await api.storage.local.get([CGX_V02_KEY, "cgx-export-index", CGX_V02_RECEIPT_KEY]);
+  const result = await api.storage.local.get([CGX_V02_KEY, "cgx-export-index", CGX_V02_RECEIPT_KEY,
+    CGX_V02_PILOT_GATE_KEY, CGX_V02_PILOT_PENDING_KEY]);
   const state = result[CGX_V02_KEY] || {};
   const index = result["cgx-export-index"];
   const receipt = result[CGX_V02_RECEIPT_KEY];
+  const gate = result[CGX_V02_PILOT_GATE_KEY];
+  const pending = result[CGX_V02_PILOT_PENDING_KEY];
   // A bare index is never treated as a verified migrated baseline.
   const indexReady = cgxV02ReceiptCoversIndex(index, receipt);
   return {
@@ -224,7 +230,13 @@ async function cgxV02Read() {
       verifiedSharedAliases: receipt.sharedAliases?.length || 0,
       indexCountAtImport: receipt.indexCountAtImport || 0,
       currentIndexCount: index && typeof index === "object" ? Object.keys(index).length : 0
-    } : null
+    } : null,
+    pilot: {
+      gatePrepared: gate?.schema === "cgx-v02-pilot-gate-v1" && gate.status === "prepared" && gate.expiresAt > Date.now(),
+      pendingStatus: pending?.schema === "cgx-v02-pilot-pending-v1" ? String(pending.status || "") : "",
+      filename: pending?.schema === "cgx-v02-pilot-pending-v1" ? String(pending.filename || "") : "",
+      byteCount: pending?.schema === "cgx-v02-pilot-pending-v1" ? Number(pending.byteCount) || 0 : 0
+    }
   };
 }
 
@@ -241,6 +253,43 @@ function cgxV02ExtractConversationId(key) {
   const id = key.slice(at + 1);
   // Supports UUID and non-UUID conversation IDs without accepting paths or URLs.
   return /^[A-Za-z0-9_-]{8,160}$/.test(id) ? id : null;
+}
+
+function cgxV02PilotTarget(target) {
+  if (!cgxV02IsPlainObject(target) ||
+      typeof target.conversationId !== "string" ||
+      typeof target.workspaceId !== "string" ||
+      !/^[A-Za-z0-9_-]{8,160}$/.test(target.conversationId) ||
+      !/^[A-Za-z0-9_-]{4,160}$/.test(target.workspaceId))
+    throw new Error("Pilot requires one exact conversation ID and workspace ID.");
+  return {
+    conversationId: target.conversationId,
+    workspaceId: target.workspaceId,
+    indexKey: `${target.workspaceId}:${target.conversationId}`
+  };
+}
+
+async function cgxV02IndexDigest(index) {
+  if (!cgxV02IsPlainObject(index)) throw new Error("Incremental index is unavailable.");
+  const rows = Object.entries(index).sort(([a], [b]) => a.localeCompare(b));
+  const bytes = new TextEncoder().encode(JSON.stringify(rows));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function cgxV02PilotEvidenceValid(evidence, target) {
+  return cgxV02IsPlainObject(evidence) &&
+    evidence.schema === "cgx-v02-pilot-browser-receipt-v1" &&
+    evidence.conversationId === target.conversationId &&
+    evidence.workspaceId === target.workspaceId &&
+    evidence.indexKey === target.indexKey &&
+    cgxV02IsPlainObject(evidence.indexEntry) &&
+    /^[a-f0-9]{64}$/i.test(evidence.indexEntry.fingerprint || "") &&
+    typeof evidence.filename === "string" && /\.zip$/i.test(evidence.filename) &&
+    Number.isSafeInteger(evidence.byteCount) && evidence.byteCount > 0 &&
+    /^[a-f0-9]{64}$/i.test(evidence.zipSha256 || "") &&
+    /^[a-f0-9]{64}$/i.test(evidence.manifestSha256 || "") &&
+    evidence.conversationCount === 1;
 }
 
 function cgxV02ReceiptCoversIndex(index, receipt) {
@@ -594,6 +643,187 @@ async function cgxV02PreviewNow() {
     return {ok:false,error:cgxV02ShortError(error)};
   } finally {cgxV02Active=false;}
 }
+
+async function cgxV02PilotRaw() {
+  return api.storage.local.get([CGX_V02_KEY, "cgx-export-index", CGX_V02_RECEIPT_KEY,
+    CGX_V02_PILOT_GATE_KEY, CGX_V02_PILOT_PENDING_KEY]);
+}
+
+function cgxV02PilotPrerequisites(raw) {
+  const state = raw[CGX_V02_KEY] || {};
+  const index = raw["cgx-export-index"];
+  const receipt = raw[CGX_V02_RECEIPT_KEY];
+  if (state.enabled === true) throw new Error("Turn off the 23:45 scheduler before pilot testing.");
+  if (!cgxV02ReceiptCoversIndex(index, receipt))
+    throw new Error("Verified migrated index required for pilot testing.");
+  if (!Array.isArray(receipt.sharedAliases) || receipt.sharedAliases.length !== 2)
+    throw new Error("Both verified shared aliases are required for this pilot.");
+  return { state, index, receipt };
+}
+
+async function cgxV02PilotPrepare(message) {
+  if (cgxV02Active) return {ok:false,error:"Another V0.2 task is running."};
+  cgxV02Active = true;
+  try {
+    const target = cgxV02PilotTarget(message.target);
+    const raw = await cgxV02PilotRaw();
+    const { index, receipt } = cgxV02PilotPrerequisites(raw);
+    const pending = raw[CGX_V02_PILOT_PENDING_KEY];
+    if (pending?.schema === "cgx-v02-pilot-pending-v1")
+      throw new Error("A pilot download is already pending or committed.");
+    if (Object.keys(index).length !== receipt.indexCountAtImport)
+      throw new Error("Real index changed after migration; pilot baseline is not pristine.");
+    if (Object.prototype.hasOwnProperty.call(index, target.indexKey))
+      throw new Error("Pilot target already exists in the real index.");
+    const tab = await cgxV02FindTab();
+    await cgxV02WaitReceiver(tab.id);
+    const result = await api.tabs.sendMessage(tab.id, {
+      type: "cgx-v02-pilot-prepare",
+      target: {conversationId: target.conversationId, workspaceId: target.workspaceId}
+    });
+    if (!result || result.ok !== true || result.selectionCount !== 1 ||
+        !Number.isInteger(result.changed) || result.changed < 1 ||
+        result.changed > CGX_V02_MAX_DAILY_DELTA ||
+        result.baselineEntries !== Object.keys(index).length ||
+        !/^[a-f0-9]{64}$/i.test(result.changeSetDigest || "") ||
+        !/^[a-f0-9]{64}$/i.test(result.targetFingerprint || ""))
+      throw new Error(result?.error || "Pilot target check did not finish safely.");
+    const token = crypto.randomUUID();
+    const gate = {
+      schema: "cgx-v02-pilot-gate-v1", status: "prepared", token,
+      preparedAt: Date.now(), expiresAt: Date.now() + CGX_V02_PILOT_GATE_TTL_MS,
+      conversationId: target.conversationId, workspaceId: target.workspaceId,
+      indexKey: target.indexKey, baselineIndexCount: Object.keys(index).length,
+      baselineIndexDigest: await cgxV02IndexDigest(index),
+      changeSetDigest: result.changeSetDigest,
+      targetFingerprint: result.targetFingerprint
+    };
+    await api.storage.local.set({[CGX_V02_PILOT_GATE_KEY]: gate});
+    return {ok:true,gateToken:token,listed:result.listed,changed:result.changed,
+      newCount:result.newCount || 0,modified:result.modified || 0,
+      selectionCount:1,expiresAt:gate.expiresAt};
+  } catch (error) {
+    return {ok:false,error:cgxV02ShortError(error)};
+  } finally { cgxV02Active = false; }
+}
+
+async function cgxV02PilotStart(message) {
+  if (cgxV02Active) return {ok:false,error:"Another V0.2 task is running."};
+  cgxV02Active = true;
+  try {
+    const raw = await cgxV02PilotRaw();
+    const { index } = cgxV02PilotPrerequisites(raw);
+    const gate = raw[CGX_V02_PILOT_GATE_KEY];
+    const pending = raw[CGX_V02_PILOT_PENDING_KEY];
+    if (pending?.schema === "cgx-v02-pilot-pending-v1")
+      throw new Error("A pilot download is already pending or committed.");
+    if (!cgxV02IsPlainObject(gate) || gate.schema !== "cgx-v02-pilot-gate-v1" ||
+        gate.status !== "prepared" || gate.token !== message.gateToken ||
+        gate.expiresAt <= Date.now())
+      throw new Error("Pilot target check is missing or expired.");
+    const target = cgxV02PilotTarget({conversationId:gate.conversationId, workspaceId:gate.workspaceId});
+    if (target.indexKey !== gate.indexKey || Object.keys(index).length !== gate.baselineIndexCount ||
+        await cgxV02IndexDigest(index) !== gate.baselineIndexDigest ||
+        Object.prototype.hasOwnProperty.call(index, target.indexKey))
+      throw new Error("Real index changed after target selection; no ZIP created.");
+    const tab = await cgxV02FindTab();
+    await cgxV02WaitReceiver(tab.id);
+    const result = await api.tabs.sendMessage(tab.id, {
+      type: "cgx-v02-pilot-export",
+      target: {conversationId:target.conversationId, workspaceId:target.workspaceId},
+      expected: {changeSetDigest:gate.changeSetDigest, targetFingerprint:gate.targetFingerprint}
+    });
+    if (!result || result.ok !== true || result.count !== 1 || result.failed ||
+        result.imageFailures || result.fileFailures || result.parts !== 1 ||
+        !cgxV02PilotEvidenceValid(result.pilotPending, target))
+      throw new Error(result?.error || "Single-conversation pilot export failed closed.");
+    const after = await cgxV02PilotRaw();
+    const afterState = cgxV02PilotPrerequisites(after);
+    if (Object.keys(afterState.index).length !== gate.baselineIndexCount ||
+        await cgxV02IndexDigest(afterState.index) !== gate.baselineIndexDigest ||
+        Object.prototype.hasOwnProperty.call(afterState.index, target.indexKey))
+      throw new Error("Real index changed during browser download; pending receipt not stored.");
+    const evidence = result.pilotPending;
+    const pendingRecord = {
+      schema: "cgx-v02-pilot-pending-v1",
+      status: "browser_download_complete_v01_pending",
+      createdAt: new Date().toISOString(),
+      conversationId: target.conversationId, workspaceId: target.workspaceId,
+      indexKey: target.indexKey, indexEntry: evidence.indexEntry,
+      baselineIndexCount: gate.baselineIndexCount,
+      baselineIndexDigest: gate.baselineIndexDigest,
+      filename: evidence.filename, byteCount: evidence.byteCount,
+      zipSha256: evidence.zipSha256, manifestSha256: evidence.manifestSha256,
+      conversationCount: 1
+    };
+    await api.storage.local.set({
+      [CGX_V02_PILOT_PENDING_KEY]: pendingRecord,
+      [CGX_V02_PILOT_GATE_KEY]: {...gate,status:"consumed",consumedAt:Date.now()}
+    });
+    return {ok:true,status:pendingRecord.status,filename:pendingRecord.filename,
+      byteCount:pendingRecord.byteCount,indexCommitted:false};
+  } catch (error) {
+    return {ok:false,error:cgxV02ShortError(error),indexCommitted:false};
+  } finally { cgxV02Active = false; }
+}
+
+function cgxV02PilotV01ReceiptMatches(receipt, pending) {
+  return cgxV02IsPlainObject(receipt) &&
+    receipt.schema === "cgx-v02-pilot-v01-receipt-v1" &&
+    receipt.status === "accepted" && receipt.v01_status === "processed_new" &&
+    receipt.conversation_id === pending.conversationId &&
+    receipt.workspace_id === pending.workspaceId &&
+    receipt.zip_sha256 === pending.zipSha256 &&
+    receipt.manifest_sha256 === pending.manifestSha256 &&
+    receipt.conversation_count === 1;
+}
+
+async function cgxV02PilotFinalize(message) {
+  if (JSON.stringify(message.receipt || {}).length > 64 * 1024)
+    return {ok:false,error:"V0.1 receipt is unexpectedly large."};
+  if (cgxV02Active) return {ok:false,error:"Another V0.2 task is running."};
+  cgxV02Active = true;
+  try {
+    const raw = await cgxV02PilotRaw();
+    const { index } = cgxV02PilotPrerequisites(raw);
+    const pending = raw[CGX_V02_PILOT_PENDING_KEY];
+    if (!cgxV02IsPlainObject(pending) || pending.schema !== "cgx-v02-pilot-pending-v1")
+      throw new Error("No browser-complete pilot is waiting for V0.1 verification.");
+    if (!cgxV02PilotV01ReceiptMatches(message.receipt, pending))
+      throw new Error("V0.1 receipt does not match the pending ZIP and exact target.");
+    if (pending.status === "committed") {
+      if (JSON.stringify(index[pending.indexKey]) !== JSON.stringify(pending.indexEntry))
+        throw new Error("Committed pilot index entry no longer matches its receipt.");
+      return {ok:true,status:"committed",alreadyCommitted:true,indexCount:Object.keys(index).length};
+    }
+    if (pending.status !== "browser_download_complete_v01_pending")
+      throw new Error("Pilot pending state is invalid.");
+    if (Object.keys(index).length !== pending.baselineIndexCount ||
+        await cgxV02IndexDigest(index) !== pending.baselineIndexDigest ||
+        Object.prototype.hasOwnProperty.call(index, pending.indexKey))
+      throw new Error("Real index changed before V0.1 acknowledgement; no commit performed.");
+    const nextIndex = {...index,[pending.indexKey]:pending.indexEntry};
+    const committed = {...pending,status:"committed",committedAt:new Date().toISOString(),
+      v01Receipt:{schema:message.receipt.schema,status:message.receipt.status,
+        verified_at:message.receipt.verified_at,zip_sha256:message.receipt.zip_sha256,
+        manifest_sha256:message.receipt.manifest_sha256}};
+    await api.storage.local.set({
+      "cgx-export-index": nextIndex,
+      [CGX_V02_PILOT_PENDING_KEY]: committed
+    });
+    const after = await api.storage.local.get(["cgx-export-index",CGX_V02_PILOT_PENDING_KEY]);
+    const afterIndex = after["cgx-export-index"];
+    if (!cgxV02IsPlainObject(afterIndex) || Object.keys(afterIndex).length !== Object.keys(index).length + 1 ||
+        JSON.stringify(afterIndex[pending.indexKey]) !== JSON.stringify(pending.indexEntry) ||
+        !Object.entries(index).every(([key,value])=>JSON.stringify(afterIndex[key])===JSON.stringify(value)) ||
+        after[CGX_V02_PILOT_PENDING_KEY]?.status !== "committed")
+      throw new Error("Pilot index commit could not be verified after write.");
+    return {ok:true,status:"committed",alreadyCommitted:false,indexCount:Object.keys(afterIndex).length};
+  } catch (error) {
+    return {ok:false,error:cgxV02ShortError(error)};
+  } finally { cgxV02Active = false; }
+}
+
 async function cgxV02Wake() {
   const { state } = await cgxV02Read();
   if (!state.enabled) return cgxV02Arm(state);
@@ -613,7 +843,8 @@ api.alarms.onAlarm.addListener(alarm => {
 // Only explicit popup control may enable the schedule. It is additionally
 // blocked when no migrated index exists, preventing a surprise 4+ GiB export.
 api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || !["cgx-v02-get", "cgx-v02-set", "cgx-v02-run-now", "cgx-v02-import-index", "cgx-v02-preview-now"].includes(message.type)) return false;
+  if (!message || !["cgx-v02-get", "cgx-v02-set", "cgx-v02-run-now", "cgx-v02-import-index", "cgx-v02-preview-now",
+    "cgx-v02-pilot-prepare", "cgx-v02-pilot-start", "cgx-v02-pilot-finalize"].includes(message.type)) return false;
   (async () => {
     if (message.type !== "cgx-v02-get") {
       // Only the extension's own popup may import baselines or control schedules.
@@ -625,6 +856,9 @@ api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return cgxV02ImportIndex(message);
     }
     if (message.type === "cgx-v02-preview-now") return cgxV02PreviewNow();
+    if (message.type === "cgx-v02-pilot-prepare") return cgxV02PilotPrepare(message);
+    if (message.type === "cgx-v02-pilot-start") return cgxV02PilotStart(message);
+    if (message.type === "cgx-v02-pilot-finalize") return cgxV02PilotFinalize(message);
     if (message.type === "cgx-v02-get") {
       const data = await cgxV02Read();
       return { ok: true, ...data, timezone: CGX_V02_TIMEZONE };

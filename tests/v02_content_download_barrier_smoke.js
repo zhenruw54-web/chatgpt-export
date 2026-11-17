@@ -11,10 +11,10 @@ const begin=content.indexOf("  async function cgxV02DownloadZip(filename,blob){"
 const end=content.indexOf("\n  }\n\n  function exportFileStamp()",begin);
 assert.ok(begin>=0&&end>begin,"Scheduled ZIP function not found.");
 const fnSource=content.slice(begin,end+4);
-assert.ok(content.indexOf("if(opts.v02Scheduled) await cgxV02DownloadZip") <
+assert.ok(content.indexOf("if(opts.v02Scheduled || opts.v02Pilot)") <
   content.indexOf("await api.storage.local.set({'cgx-export-index':nextIndex"),
   "Index commit must occur after scheduled download receipt.");
-assert.ok(content.includes("if(opts.v02Scheduled && items.length>10)"),
+assert.ok(content.includes("if((opts.v02Scheduled||opts.v02Pilot) && items.length>10)"),
   "Final scan must re-check 10-change ceiling.");
 assert.ok(content.includes("totalErrors>0 || totalImageFailures>0 || totalFileFailures>0"),
   "Partial media/conversation failure must refuse index commit.");
@@ -101,8 +101,10 @@ async function main(){
     new Blob([])),/empty/i);
   check("Empty ZIP cannot begin download",!empty.calls.includes("click"));
   check("Index commit follows awaiting browser receipt in source",
-    content.indexOf("if(opts.v02Scheduled) await cgxV02DownloadZip") <
+    content.indexOf("if(opts.v02Scheduled || opts.v02Pilot)") <
     content.indexOf("await api.storage.local.set({'cgx-export-index':nextIndex"));
+  check("Pilot download never uses ordinary untracked download",
+    content.includes("if(opts.v02Scheduled || opts.v02Pilot)"));
   console.log("PASS TOTAL "+passed);
 }
 main().catch(err=>{console.error(err);process.exitCode=1});

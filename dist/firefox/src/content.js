@@ -63,7 +63,7 @@
     if (typeof value === 'object') {
       const out={};
       for (const [k,v] of Object.entries(value)) {
-        if (/token|authorization|cookie|content|message|text|body|data/i.test(k)) { out[k]='<omitted>'; continue; }
+        if (/token|authorization|cookie|content|message|text|body|data|conversation|workspace|indexkey|fingerprint|sha256/i.test(k)) { out[k]='<omitted>'; continue; }
         out[k]=diagnosticDetails(v, depth+1);
       }
       return out;
@@ -451,7 +451,7 @@
       branch:'current', branch_count:branchCount,
       project_id:source.projectId||null, project_title:source.projectTitle||null,
       archived:!!source.archived, shared:!!source.shared, share_id:source.shareId||null,
-      workspace_id:source.accountId||null,
+      workspace_id:source.workspaceId||source.accountId||null,
       export_formats:{markdown:!!opts.md,html:!!opts.html,embedded_markdown:!!opts.embeddedMd,raw_json:!!opts.json,thinking_summaries:!!opts.thinking},
       capability_snapshot: capabilitySnapshot()
     };
@@ -530,6 +530,49 @@
   function download(filename,blob){
     checkCancelled();
     const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
+  }
+
+  // Scheduled ZIP only: browser MUST report download completion before any
+  // incremental index advances. Manual export still uses its old path.
+  // A timeout, crash, interrupted download or unknown receipt fails closed.
+  async function cgxV02DownloadZip(filename,blob){
+    checkCancelled();
+    if (!(blob instanceof Blob) || blob.size <= 0)
+      throw new Error('Scheduled ZIP was empty; index not updated.');
+    const url=URL.createObjectURL(blob);
+    let token=null;
+    try {
+      const registered=await api.runtime.sendMessage({
+        type:'cgx-v02-watch-zip',url,filename,expectedBytes:blob.size
+      });
+      if(!registered || registered.ok!==true || !registered.token)
+        throw new Error(registered?.error||'Cannot track scheduled ZIP download.');
+      token=registered.token;
+      const a=document.createElement('a');
+      a.href=url;
+      a.download=filename;
+      document.body.appendChild(a);
+      try { a.click(); } finally { a.remove(); }
+      const receipt=await api.runtime.sendMessage({
+        type:'cgx-v02-await-zip',token
+      });
+      if(!receipt || receipt.ok!==true || receipt.status!=='browser_download_complete')
+        throw new Error(receipt?.error||'Browser ZIP completion was not verified; index unchanged.');
+      checkCancelled();
+      return receipt;
+    } catch (error) {
+      // If the anchor click throws or the task is cancelled, release the
+      // observer session. Never remove a user's downloaded ZIP.
+      if (token) {
+        try { await api.runtime.sendMessage({type:'cgx-v02-abort-zip',token}); }
+        catch (_) {}
+      }
+      throw error;
+    } finally {
+      // Do not revoke while downloading. Even a failed or timed-out job is
+      // kept long enough for the browser to finish its own cleanup.
+      setTimeout(()=>URL.revokeObjectURL(url),30000);
+    }
   }
 
   function exportFileStamp(){return new Date().toISOString().replace('T','_').replace(/[:.]/g,'-');}
@@ -1226,17 +1269,90 @@
 
   async function finalizePart(files,index,meta,opts,partNo){
     checkCancelled();
+    if(opts.v02Pilot && (partNo!==1 || index.length!==1))
+      throw new Error('Pilot gate requires exactly one conversation in one ZIP part.');
     if(opts.html&&index.length)files.push({name:'index.html',content:CGX.indexHtml(index)});
     if(meta.projectsIndex&&meta.projectsIndex.length)files.push({name:'projects/project-index.json',content:JSON.stringify(meta.projectsIndex,null,2)});
     if(meta.errors&&meta.errors.length)files.push({name:'_erreurs.txt',content:meta.errors.join('\n')+'\n'});
     if((meta.errors&&meta.errors.length)||meta.imageFailures||meta.fileFailures)files.push({name:'_diagnostic.log',content:diagnosticLog({result:{conversation_failures:(meta.errors||[]).length,image_failures:meta.imageFailures||0,file_failures:meta.fileFailures||0,part:partNo}})});
     files.push({name:'_capabilities.json',content:JSON.stringify(capabilitySnapshot(),null,2)});
     await addManifest(files,{schema_version:4,exported_at:new Date().toISOString(),embedded_markdown:!!opts.embeddedMd,conversation_count:index.length,failures:(meta.errors||[]).length,image_failures:meta.imageFailures||0,file_failures:meta.fileFailures||0,workspace_ids:meta.accounts||[],part:partNo,incremental_since:meta.since||null,capabilities:capabilitySnapshot()},opts.checksums);
+    const manifestFile=files.find(file=>file.name==='manifest.json');
+    if(!manifestFile || typeof manifestFile.content!=='string')
+      throw new Error('ZIP manifest was not created.');
+    const manifest=JSON.parse(manifestFile.content);
+    if(opts.v02Pilot && manifest.conversation_count!==1)
+      throw new Error('Pilot manifest conversation count is not exactly one.');
     const stamp=exportFileStamp();const suffix=partNo>1?`_part-${String(partNo).padStart(3,'0')}`:'';
     checkCancelled();
-    checkCancelled();download(`chatgpt-export_${stamp}${suffix}.zip`,CGX_buildZip(files));
+    const name=`chatgpt-export_${stamp}${suffix}.zip`;
+    const blob=CGX_buildZip(files);
+    if(opts.v02Scheduled || opts.v02Pilot){
+      const receipt=await cgxV02DownloadZip(name,blob);
+      if(opts.v02Pilot)return{
+        filename:name,byteCount:receipt.byteCount,
+        zipSha256:await sha256Hex(await blob.arrayBuffer()),
+        manifestSha256:await sha256Hex(manifestFile.content),
+        conversationCount:manifest.conversation_count
+      };
+    }else download(name,blob);
+    return null;
   }
 
+  function cgxV02PilotTargetKey(target){
+    if(!target || typeof target.conversationId!=='string' || typeof target.workspaceId!=='string' ||
+        !/^[A-Za-z0-9_-]{8,160}$/.test(target.conversationId) ||
+        !/^[A-Za-z0-9_-]{4,160}$/.test(target.workspaceId))
+      throw new Error('Pilot requires one exact conversation ID and workspace ID.');
+    return `${target.workspaceId}:${target.conversationId}`;
+  }
+
+  async function cgxV02ScanDelta(previousIndex,listed){
+    if(!previousIndex||typeof previousIndex!=='object'||Array.isArray(previousIndex)||
+        Object.keys(previousIndex).length<65)
+      throw new Error('Incremental baseline missing. No preview/export started.');
+    if(!listed||!Array.isArray(listed.items)||listed.items.length===0)
+      throw new Error('History listing empty or unavailable; refusing automatic export.');
+    const items=[];let newCount=0,modified=0;
+    for(const item of listed.items){
+      checkCancelled();
+      const id=item.conversation_id||item.id;
+      if(!id)throw new Error('History item lacks an identifier.');
+      const key=`${item._cgxAccountId||'personal'}:${id}`;
+      const fingerprint=await sha256Hex(JSON.stringify([
+        item.update_time||item.create_time||null,item.title||'',
+        !!item._cgxArchived,item._cgxProjectId||null,item._cgxShareId||null
+      ]));
+      item._cgxFingerprint=fingerprint;item._cgxIndexKey=key;
+      if(!previousIndex[key]){items.push(item);newCount++;}
+      else if(previousIndex[key].fingerprint!==fingerprint){items.push(item);modified++;}
+    }
+    const digestRows=items.map(item=>[item._cgxIndexKey,item._cgxFingerprint])
+      .sort((a,b)=>a[0].localeCompare(b[0]));
+    return{items,newCount,modified,changeSetDigest:await sha256Hex(JSON.stringify(digestRows))};
+  }
+
+  // Read-only metadata preview. No ZIP, no index writes, no IDs in result.
+  async function cgxV02PreviewDelta(target=null){
+    checkCancelled();
+    const previousIndex=await storageGet('cgx-export-index');
+    const listed=await listAll({conversationLimit:0,since:null},
+      label=>progressPercent(1,label));
+    const delta=await cgxV02ScanDelta(previousIndex,listed);
+    const result={listed:listed.items.length,changed:delta.items.length,
+      newCount:delta.newCount,modified:delta.modified,
+      baselineEntries:Object.keys(previousIndex).length};
+    if(target){
+      const targetKey=cgxV02PilotTargetKey(target);
+      if(previousIndex[targetKey])throw new Error('Pilot target already exists in the real index.');
+      if(delta.items.length>10)throw new Error('Pilot delta exceeds the 10-conversation safety limit.');
+      const selected=delta.items.filter(item=>item._cgxIndexKey===targetKey);
+      if(selected.length!==1)throw new Error('Pilot target did not resolve to exactly one new conversation.');
+      return{...result,selectionCount:1,changeSetDigest:delta.changeSetDigest,
+        targetFingerprint:selected[0]._cgxFingerprint};
+    }
+    return result;
+  }
   async function exportAll(opts, preparedList=null){
     progressPercent(1,'Searching account history…');
     const last=opts.incremental?await storageGet('cgx-last-full-export'):null;
@@ -1244,20 +1360,33 @@
     const listed=preparedList||await listAll({...opts,since:null},label=>progressPercent(1,label));
     progressPercent(7,`Found ${listed.items.length} conversation${listed.items.length===1?'':'s'}.`);
     if(opts.format==='jex') return exportAllJex(opts,listed);
-    const nextIndex={...previousIndex}; const items=[];
-    for (const item of listed.items) {
-      checkCancelled();
-      const id=item.conversation_id||item.id; const key=`${item._cgxAccountId||'personal'}:${id}`;
-      const fingerprint=await sha256Hex(JSON.stringify([item.update_time||item.create_time||null,item.title||'',!!item._cgxArchived,item._cgxProjectId||null,item._cgxShareId||null]));
-      item._cgxFingerprint=fingerprint; item._cgxIndexKey=key;
-      if (!opts.incremental || !previousIndex[key] || previousIndex[key].fingerprint!==fingerprint) items.push(item);
-    }
+    const nextIndex={...previousIndex}; let items=[];
+    if(opts.incremental){
+      const delta=await cgxV02ScanDelta(previousIndex,listed);
+      items=delta.items;
+      if(opts.v02Pilot){
+        const targetKey=cgxV02PilotTargetKey(opts.v02PilotTarget);
+        if(previousIndex[targetKey])throw new Error('Pilot target already exists in the real index.');
+        if(items.length>10)throw new Error('Pilot delta grew above 10; no ZIP or index update.');
+        if(delta.changeSetDigest!==opts.v02PilotExpected?.changeSetDigest)
+          throw new Error('Pilot delta changed after selection; run the target check again.');
+        const selected=items.filter(item=>item._cgxIndexKey===targetKey);
+        if(selected.length!==1 || selected[0]._cgxFingerprint!==opts.v02PilotExpected?.targetFingerprint)
+          throw new Error('Pilot target identity changed after selection; no ZIP created.');
+        items=selected;
+      }
+    }else items=listed.items.slice();
     const limit=Math.max(0,Math.floor(Number(opts.conversationLimit)||0));
-    if(limit)items.splice(limit);
-    if(!items.length)throw new Error(opts.incremental?'No new or modified conversations since the last export.':'No conversations found.');
+    if(limit&&!opts.v02Pilot)items.splice(limit);
+    if(!items.length){if(opts.v02Scheduled)return {count:0,failed:0,imageFailures:0,fileFailures:0,parts:0,noChanges:true};throw new Error(opts.incremental?'No new or modified conversations since the last export.':'No conversations found.');}
+    // Race guard: revalidate AFTER the exporter's independent history scan.
+    // A preview of 5 followed by 65 changed entries must never create a ZIP.
+    if((opts.v02Scheduled||opts.v02Pilot) && items.length>10)
+      throw new Error('Scheduled delta grew above 10 after preview; no ZIP or index update.');
     let files=[],index=[],used=new Set(),errors=[],failedIds=[];let imageFailures=0,fileFailures=0,totalErrors=0,totalImageFailures=0,totalFileFailures=0,part=1,parts=0,bytes=0;
     const maxBytes=Math.max(100,Number(opts.partSizeMB)||1024)*1024*1024;
-    const flush=async(force=false)=>{if(!files.length&&!force)return;checkCancelled();totalErrors+=errors.length;totalImageFailures+=imageFailures;totalFileFailures+=fileFailures;await finalizePart(files,index,{projectsIndex:listed.projectsIndex,errors,imageFailures,fileFailures,accounts:listed.accounts,since:opts.since},opts,part);parts++;part++;files=[];index=[];errors=[];imageFailures=0;fileFailures=0;bytes=0;await jobSleep(500);};
+    let pilotEvidence=null;
+    const flush=async(force=false)=>{if(!files.length&&!force)return;checkCancelled();totalErrors+=errors.length;totalImageFailures+=imageFailures;totalFileFailures+=fileFailures;const accounts=opts.v02Pilot?[opts.v02PilotTarget.workspaceId]:listed.accounts;const projectsIndex=opts.v02Pilot?[]:listed.projectsIndex;const evidence=await finalizePart(files,index,{projectsIndex,errors,imageFailures,fileFailures,accounts,since:opts.since},opts,part);if(evidence)pilotEvidence=evidence;parts++;part++;files=[];index=[];errors=[];imageFailures=0;fileFailures=0;bytes=0;await jobSleep(500);};
     for(let i=0;i<items.length;i++){
       checkCancelled();
       const item=items[i],id=item.conversation_id||item.id,accountId=item._cgxAccountId||null;
@@ -1277,7 +1406,7 @@
         let folder=CGX.safeName(item);const key=`${root}${folder}`;if(used.has(key))folder+=`_${String(id).slice(0,8)}`;used.add(`${root}${folder}`);const prefix=`${root}${folder}/`;
         let convOverride=null;
         if(item._cgxShared && !item.mapping && item._cgxShareId){try{const sd=await apiGet(`/backend-api/share/${encodeURIComponent(item._cgxShareId)}`,accountId);convOverride=sd.conversation||sd;}catch(e){checkCancelled();} }
-        const r=await exportConversation(id,opts,prefix,{projectId:item._cgxProjectId,projectTitle:item._cgxProjectTitle,archived:item._cgxArchived,shared:item._cgxShared,shareId:item._cgxShareId,accountId},convOverride,(p,label)=>overall(p,label));
+        const r=await exportConversation(id,opts,prefix,{projectId:item._cgxProjectId,projectTitle:item._cgxProjectTitle,archived:item._cgxArchived,shared:item._cgxShared,shareId:item._cgxShareId,accountId,workspaceId:opts.v02Pilot?opts.v02PilotTarget.workspaceId:null},convOverride,(p,label)=>overall(p,label));
         const rBytes=r.files.reduce((n,f)=>n+sizeOf(f),0);
         if(files.length&&bytes+rBytes>maxBytes)await flush();
         files.push(...r.files);bytes+=rBytes;imageFailures+=r.imageFailures;fileFailures+=r.fileFailures;
@@ -1288,11 +1417,31 @@
       await jobSleep(DELAY_MS);
     }
     checkCancelled();
+    if(opts.v02Pilot && (errors.length>0 || imageFailures>0 || fileFailures>0))
+      throw new Error('Pilot conversation or media failed; no ZIP or index update.');
     progressPercent(100,'Finalizing archive…',items.length,items.length);await flush(true);
     progressPercent(100,'Saving export state…',items.length,items.length);
-    await storageSet({'cgx-export-index':nextIndex,'cgx-last-full-export':Date.now()});
+    // A completed ZIP with missing attachments or failed conversations is
+    // NOT a complete knowledge snapshot. Keep the previous index intact.
+    if(opts.v02Scheduled && (totalErrors>0 || totalImageFailures>0 || totalFileFailures>0))
+      throw new Error('Partial ZIP: conversation/media failures; keep prior index and review downloaded ZIP.');
+    // Scheduled storage errors must not be swallowed.
+    // This is NOT proof of a durable Windows ZIP download.
+    if(opts.v02Scheduled)
+      await api.storage.local.set({'cgx-export-index':nextIndex,'cgx-last-full-export':Date.now()});
+    else if(!opts.v02Pilot) await storageSet({'cgx-export-index':nextIndex,'cgx-last-full-export':Date.now()});
     progressPercent(100,'Export ready.',items.length,items.length);
-    return{count:items.length-totalErrors,failed:totalErrors,failedIds,imageFailures:totalImageFailures,fileFailures:totalFileFailures,parts,exportedItems:succeededItems(items,failedIds),projectDeletionCandidates:listed.projectDeletionCandidates||[]};
+    const result={count:items.length-totalErrors,failed:totalErrors,failedIds,imageFailures:totalImageFailures,fileFailures:totalFileFailures,parts,exportedItems:succeededItems(items,failedIds),projectDeletionCandidates:listed.projectDeletionCandidates||[]};
+    if(opts.v02Pilot){
+      const targetKey=cgxV02PilotTargetKey(opts.v02PilotTarget);
+      if(!pilotEvidence || pilotEvidence.conversationCount!==1 || !nextIndex[targetKey])
+        throw new Error('Pilot ZIP evidence is incomplete; real index unchanged.');
+      result.pilotPending={schema:'cgx-v02-pilot-browser-receipt-v1',
+        conversationId:opts.v02PilotTarget.conversationId,
+        workspaceId:opts.v02PilotTarget.workspaceId,indexKey:targetKey,
+        indexEntry:nextIndex[targetKey],...pilotEvidence};
+    }
+    return result;
   }
   function succeededItems(items,failedIds){
     const failed=new Set((failedIds||[]).map(f=>JSON.stringify([f.accountId||'',f.id||''])));
@@ -1531,10 +1680,33 @@
     }
     if(msg.type==='cgx-ping'){const t=currentTarget();storageGet('cgx-last-full-export').then(last=>sendResponse({ok:true,busy,hasConversation:!!t,lastExport:last||null,progress:progressState,activity:activityState,failures:liveFailureDetails,lastJob:lastExportState}));return true;}
     if(msg.type==='cgx-manager-list')return withBusyJob(sendResponse,'conversation list',managerList);
+    if(msg.type==='cgx-v02-preview')return withBusyJob(sendResponse,'scheduled delta preview',cgxV02PreviewDelta);
+    if(msg.type==='cgx-v02-pilot-prepare')return withBusyJob(sendResponse,'single conversation pilot check',()=>cgxV02PreviewDelta(msg.target));
     if(msg.type==='cgx-manager-run')return withBusyJob(sendResponse,'selected conversation actions',()=>managerRun(msg));
-    if(msg.type!=='cgx-export-current'&&msg.type!=='cgx-export-all')return false;
+    if(msg.type!=='cgx-export-current'&&msg.type!=='cgx-export-all'&&msg.type!=='cgx-v02-auto-export'&&msg.type!=='cgx-v02-pilot-export')return false;
     if(busy){sendResponse({ok:false,error:'An export is already running in this tab.',diagnostics:diagnosticSnapshot({error:{message:'Export already running.'}})});return false;}
     const opts={md:true,html:true,images:true,files:true,json:false,thinking:false,embeddedMd:false,modernEmbeddedMd:false,branches:false,checksums:true,incremental:false,partSizeMB:1024,...(msg.options||{})};
+    // Never trust message-provided deletion, full export, format or limit in
+    // scheduled mode. The old extension's ordinary manual export is unchanged.
+    if(msg.type==='cgx-v02-auto-export'){
+      Object.assign(opts,{
+        format:'md',md:true,html:false,images:true,files:true,json:true,
+        thinking:false,branches:false,mdHtml:false,embeddedMd:false,
+        modernEmbeddedMd:false,incremental:true,checksums:true,
+        conversationLimit:0,autoDeleteAfterExport:false,
+        autoDeleteProjectsAfterExport:false,v02Scheduled:true
+      });
+    }
+    if(msg.type==='cgx-v02-pilot-export'){
+      Object.assign(opts,{
+        format:'md',md:true,html:false,images:true,files:true,json:true,
+        thinking:false,branches:false,mdHtml:false,embeddedMd:false,
+        modernEmbeddedMd:false,incremental:true,checksums:true,
+        conversationLimit:0,autoDeleteAfterExport:false,
+        autoDeleteProjectsAfterExport:false,v02Pilot:true,
+        v02PilotTarget:msg.target,v02PilotExpected:msg.expected
+      });
+    }
     opts.modernEmbeddedMd = opts.format === 'jex' || !!opts.modernEmbeddedMd;
     opts.jexRichHtml = !!opts.jexRichHtml && opts.format !== 'jex';
     opts.jexCompactHtml = opts.format === 'jex' || !!opts.jexCompactHtml;

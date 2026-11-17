@@ -746,18 +746,43 @@ async function cgxV02InitUI() {
   const importResult = $("cgx-v02-import-result");
   const previewButton = $("cgx-v02-preview-button");
   const previewResult = $("cgx-v02-preview-result");
-  if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !aliasFile || !importResult || !previewButton || !previewResult) return;
+  const pilotConversation = $("cgx-v02-pilot-conversation");
+  const pilotWorkspace = $("cgx-v02-pilot-workspace");
+  const pilotPrepare = $("cgx-v02-pilot-prepare");
+  const pilotStart = $("cgx-v02-pilot-start");
+  const pilotResult = $("cgx-v02-pilot-result");
+  const pilotReceipt = $("cgx-v02-pilot-receipt");
+  const pilotFinalize = $("cgx-v02-pilot-finalize");
+  if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !aliasFile || !importResult || !previewButton || !previewResult ||
+      !pilotConversation || !pilotWorkspace || !pilotPrepare || !pilotStart || !pilotResult || !pilotReceipt || !pilotFinalize) return;
   let baselineReady = false;
+  let pilotGateToken = "";
+  let currentData = null;
   function canImport() {
     return !baselineReady && !!(sourceFile.files?.length && baselineFile.files?.length && !enabled.checked);
   }
+  function validPilotInput() {
+    return /^[A-Za-z0-9_-]{8,160}$/.test(pilotConversation.value.trim()) &&
+      /^[A-Za-z0-9_-]{4,160}$/.test(pilotWorkspace.value.trim());
+  }
+  function updatePilotButtons() {
+    const pending = currentData?.pilot?.pendingStatus || "";
+    const aliasesReady = currentData?.migration?.verifiedSharedAliases === 2;
+    const ready = baselineReady && aliasesReady && !enabled.checked && !pending;
+    pilotPrepare.disabled = !ready || !validPilotInput();
+    pilotStart.disabled = !ready || !pilotGateToken;
+    pilotFinalize.disabled = pending !== "browser_download_complete_v01_pending" ||
+      !pilotReceipt.files?.length;
+  }
   function showState(data) {
+    currentData = data;
     const state = data.state || {};
     enabled.checked = !!state.enabled;
     baselineReady = !!data.indexReady;
     enabled.disabled = !data.indexReady;
     previewButton.disabled = !data.indexReady;
     importButton.disabled = !canImport();
+    updatePilotButtons();
     if (!data.indexReady) {
       info.textContent = "旧版增量索引尚未通过核对。自动采集已锁定，避免重新下载全部历史。";
       return;
@@ -767,6 +792,10 @@ async function cgxV02InitUI() {
       ? "已开启；下次计划：" + due + "（北京时间）；上次状态：" + (state.lastStatus || "无")
       : "历史基线已存在；自动采集当前关闭。";
     if (state.lastError) info.textContent += "；错误：" + state.lastError;
+    if (data.pilot?.pendingStatus === "browser_download_complete_v01_pending")
+      pilotResult.textContent = "浏览器下载已确认，真实索引尚未提交；请先完成 ZIP 与 V0.1 测试副本验收。";
+    else if (data.pilot?.pendingStatus === "committed")
+      pilotResult.textContent = "单条 ZIP 已通过 V0.1 回执核对，该条索引已提交。";
   }
   async function refresh() {
     try {
@@ -806,6 +835,68 @@ async function cgxV02InitUI() {
           : "超出保护上限 " + result.maxPilotDelta + " 条，禁止自动导出。");
     } catch (e) {
       previewResult.textContent = "预检未通过，不会下载：" + String(e?.message || e);
+    }
+    await refresh();
+  });
+
+  function pilotInputChanged() {
+    pilotGateToken = "";
+    pilotResult.textContent = "";
+    updatePilotButtons();
+  }
+  pilotConversation.addEventListener("input", pilotInputChanged);
+  pilotWorkspace.addEventListener("input", pilotInputChanged);
+  pilotReceipt.addEventListener("change", updatePilotButtons);
+  pilotPrepare.addEventListener("click", async () => {
+    pilotPrepare.disabled = true;
+    pilotStart.disabled = true;
+    pilotResult.textContent = "正在精确核对目标并记录本次变化摘要；不会下载…";
+    try {
+      const result = await api.runtime.sendMessage({
+        type:"cgx-v02-pilot-prepare",
+        target:{conversationId:pilotConversation.value.trim(),workspaceId:pilotWorkspace.value.trim()}
+      });
+      if(!result?.ok || !result.gateToken) throw new Error(result?.error || "目标核对失败");
+      pilotGateToken = result.gateToken;
+      pilotResult.textContent = "已核对 1 条新目标；本次扫描共 " + result.changed +
+        " 条变化，低于保护上限。下载前仍会重新扫描。";
+    } catch (error) {
+      pilotGateToken = "";
+      pilotResult.textContent = "目标未通过，不会下载：" + String(error?.message || error);
+    }
+    updatePilotButtons();
+  });
+  pilotStart.addEventListener("click", async () => {
+    const token = pilotGateToken;
+    pilotGateToken = "";
+    pilotStart.disabled = true;
+    pilotPrepare.disabled = true;
+    pilotResult.textContent = "正在重新扫描并生成一条测试 ZIP；真实索引保持不变…";
+    try {
+      const result = await api.runtime.sendMessage({type:"cgx-v02-pilot-start",gateToken:token});
+      if(!result?.ok || result.indexCommitted !== false)
+        throw new Error(result?.error || "单条下载未安全完成");
+      pilotResult.textContent = "下载已由浏览器确认；真实索引尚未提交，等待 V0.1 本地验收回执。";
+    } catch (error) {
+      pilotResult.textContent = "下载验收未通过，真实索引未改变：" + String(error?.message || error);
+    }
+    await refresh();
+  });
+  pilotFinalize.addEventListener("click", async () => {
+    pilotFinalize.disabled = true;
+    try {
+      const file = pilotReceipt.files?.[0];
+      if(!file || file.size > 64 * 1024) throw new Error("请选择小于64KB的本地V0.1验收回执。");
+      const receipt = JSON.parse(await file.text());
+      const result = await api.runtime.sendMessage({type:"cgx-v02-pilot-finalize",receipt});
+      if(!result?.ok || result.status !== "committed")
+        throw new Error(result?.error || "回执核对失败");
+      pilotResult.textContent = result.alreadyCommitted
+        ? "该回执已提交过，索引保持幂等。"
+        : "V0.1回执已核对，仅新增这一条索引。";
+      pilotReceipt.value = "";
+    } catch (error) {
+      pilotResult.textContent = "未提交索引：" + String(error?.message || error);
     }
     await refresh();
   });

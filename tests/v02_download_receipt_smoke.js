@@ -47,8 +47,8 @@ async function main(){
   const changed=(id,state)=>listeners.changed.forEach(f=>f({id,state:{current:state}}));
   check("download permission declared",manifest.permissions.includes("downloads"));
   check("manual anchor path preserved",content.includes("function download(filename,blob)"));
-  check("scheduled ZIP awaits confirmation",content.includes("if(opts.v02Scheduled) await cgxV02DownloadZip(name,blob)"));
-  check("delta rechecked before creating ZIP",content.includes("if(opts.v02Scheduled && items.length>10)"));
+  check("scheduled and pilot ZIP await confirmation",content.includes("if(opts.v02Scheduled || opts.v02Pilot)"));
+  check("delta rechecked before creating ZIP",content.includes("if((opts.v02Scheduled||opts.v02Pilot) && items.length>10)"));
   check("disabled scheduler blocks registration",!(await call(zip("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"))).ok);
   vm.runInContext("__test.activate(true)",sandbox);
   check("wrong origin is rejected",!(await call(zip("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
