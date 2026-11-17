@@ -1323,6 +1323,10 @@
     const limit=Math.max(0,Math.floor(Number(opts.conversationLimit)||0));
     if(limit)items.splice(limit);
     if(!items.length){if(opts.v02Scheduled)return {count:0,failed:0,imageFailures:0,fileFailures:0,parts:0,noChanges:true};throw new Error(opts.incremental?'No new or modified conversations since the last export.':'No conversations found.');}
+    // Race guard: revalidate AFTER the exporter's independent history scan.
+    // A preview of 5 followed by 65 changed entries must never create a ZIP.
+    if(opts.v02Scheduled && items.length>10)
+      throw new Error('Scheduled delta grew above 10 after preview; no ZIP or index update.');
     let files=[],index=[],used=new Set(),errors=[],failedIds=[];let imageFailures=0,fileFailures=0,totalErrors=0,totalImageFailures=0,totalFileFailures=0,part=1,parts=0,bytes=0;
     const maxBytes=Math.max(100,Number(opts.partSizeMB)||1024)*1024*1024;
     const flush=async(force=false)=>{if(!files.length&&!force)return;checkCancelled();totalErrors+=errors.length;totalImageFailures+=imageFailures;totalFileFailures+=fileFailures;await finalizePart(files,index,{projectsIndex:listed.projectsIndex,errors,imageFailures,fileFailures,accounts:listed.accounts,since:opts.since},opts,part);parts++;part++;files=[];index=[];errors=[];imageFailures=0;fileFailures=0;bytes=0;await jobSleep(500);};
