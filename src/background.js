@@ -537,7 +537,7 @@ async function cgxV02Run(reason = "alarm") {
     // This confirms content-script processing, NOT durable filesystem or F-drive archiving.
     if (!result || !result.ok) throw new Error(result?.error || "Export did not complete.");
     state.lastStatus = result.noChanges ? "no_changes" :
-      (result.failed || result.imageFailures || result.fileFailures ? "partial" : "export_started_download_unverified");
+      (result.failed || result.imageFailures || result.fileFailures ? "partial" : "browser_download_complete_v01_unverified");
     state.lastExportCompletedAt = Date.now();
     await cgxV02Write(state);
     return {
