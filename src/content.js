@@ -1254,7 +1254,7 @@
     }
     const limit=Math.max(0,Math.floor(Number(opts.conversationLimit)||0));
     if(limit)items.splice(limit);
-    if(!items.length)throw new Error(opts.incremental?'No new or modified conversations since the last export.':'No conversations found.');
+    if(!items.length){if(opts.v02Scheduled)return {count:0,failed:0,imageFailures:0,fileFailures:0,parts:0,noChanges:true};throw new Error(opts.incremental?'No new or modified conversations since the last export.':'No conversations found.');}
     let files=[],index=[],used=new Set(),errors=[],failedIds=[];let imageFailures=0,fileFailures=0,totalErrors=0,totalImageFailures=0,totalFileFailures=0,part=1,parts=0,bytes=0;
     const maxBytes=Math.max(100,Number(opts.partSizeMB)||1024)*1024*1024;
     const flush=async(force=false)=>{if(!files.length&&!force)return;checkCancelled();totalErrors+=errors.length;totalImageFailures+=imageFailures;totalFileFailures+=fileFailures;await finalizePart(files,index,{projectsIndex:listed.projectsIndex,errors,imageFailures,fileFailures,accounts:listed.accounts,since:opts.since},opts,part);parts++;part++;files=[];index=[];errors=[];imageFailures=0;fileFailures=0;bytes=0;await jobSleep(500);};
@@ -1532,9 +1532,20 @@
     if(msg.type==='cgx-ping'){const t=currentTarget();storageGet('cgx-last-full-export').then(last=>sendResponse({ok:true,busy,hasConversation:!!t,lastExport:last||null,progress:progressState,activity:activityState,failures:liveFailureDetails,lastJob:lastExportState}));return true;}
     if(msg.type==='cgx-manager-list')return withBusyJob(sendResponse,'conversation list',managerList);
     if(msg.type==='cgx-manager-run')return withBusyJob(sendResponse,'selected conversation actions',()=>managerRun(msg));
-    if(msg.type!=='cgx-export-current'&&msg.type!=='cgx-export-all')return false;
+    if(msg.type!=='cgx-export-current'&&msg.type!=='cgx-export-all'&&msg.type!=='cgx-v02-auto-export')return false;
     if(busy){sendResponse({ok:false,error:'An export is already running in this tab.',diagnostics:diagnosticSnapshot({error:{message:'Export already running.'}})});return false;}
     const opts={md:true,html:true,images:true,files:true,json:false,thinking:false,embeddedMd:false,modernEmbeddedMd:false,branches:false,checksums:true,incremental:false,partSizeMB:1024,...(msg.options||{})};
+    // Never trust message-provided deletion, full export, format or limit in
+    // scheduled mode. The old extension's ordinary manual export is unchanged.
+    if(msg.type==='cgx-v02-auto-export'){
+      Object.assign(opts,{
+        format:'md',md:true,html:false,images:true,files:true,json:true,
+        thinking:false,branches:false,mdHtml:false,embeddedMd:false,
+        modernEmbeddedMd:false,incremental:true,checksums:true,
+        conversationLimit:0,autoDeleteAfterExport:false,
+        autoDeleteProjectsAfterExport:false,v02Scheduled:true
+      });
+    }
     opts.modernEmbeddedMd = opts.format === 'jex' || !!opts.modernEmbeddedMd;
     opts.jexRichHtml = !!opts.jexRichHtml && opts.format !== 'jex';
     opts.jexCompactHtml = opts.format === 'jex' || !!opts.jexCompactHtml;
