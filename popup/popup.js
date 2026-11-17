@@ -742,8 +742,9 @@ async function cgxV02InitUI() {
   const importButton = $("cgx-v02-import-index");
   const sourceFile = $("cgx-v02-source-file");
   const baselineFile = $("cgx-v02-baseline-file");
+  const aliasFile = $("cgx-v02-alias-file");
   const importResult = $("cgx-v02-import-result");
-  if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !importResult) return;
+  if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !aliasFile || !importResult) return;
   let baselineReady = false;
   function canImport() {
     return !baselineReady && !!(sourceFile.files?.length && baselineFile.files?.length && !enabled.checked);
@@ -791,25 +792,30 @@ async function cgxV02InitUI() {
   }
   sourceFile.addEventListener("change", updateImportButton);
   baselineFile.addEventListener("change", updateImportButton);
+  aliasFile.addEventListener("change", updateImportButton);
   importButton.addEventListener("click", async () => {
     importButton.disabled = true;
     importResult.textContent = "正在本地验证两份索引文件…";
     try {
       const first = sourceFile.files?.[0];
       const second = baselineFile.files?.[0];
-      if (!first || !second || first.size > 512 * 1024 || second.size > 512 * 1024)
-        throw new Error("请选择两个各不超过512KB的JSON文件。");
+      const third = aliasFile.files?.[0] || null;
+      if (!first || !second || [first, second, third].filter(Boolean).some(f => f.size > 512 * 1024))
+        throw new Error("请选择必要JSON文件，单个文件不能超过512KB。");
       const source = JSON.parse(await first.text());
       const baseline = JSON.parse(await second.text());
+      const aliasProof = third ? JSON.parse(await third.text()) : null;
       const result = await api.runtime.sendMessage({
-        type: "cgx-v02-import-index", source, baseline
+        type: "cgx-v02-import-index", source, baseline, aliasProof
       });
       if (!result?.ok) throw new Error(result?.error || "迁移失败");
       importResult.textContent =
         "本地索引核验成功：" + result.matchedBaselineIds + "条基线已匹配，" +
-        result.importedEntries + "条旧扩展记录已迁移。现在可以单独测试增量功能。";
+        result.importedEntries + "条旧扩展记录已迁移，其中shared映射" +
+        result.mappedSharedAliases + "条。后续仍需Windows受控增量验收。";
       sourceFile.value = "";
       baselineFile.value = "";
+      aliasFile.value = "";
     } catch (error) {
       importResult.textContent = "未执行迁移：" + String(error?.message || error);
     }
