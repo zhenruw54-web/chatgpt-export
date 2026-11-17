@@ -112,7 +112,11 @@ function cgxV02ShortError(error) {
     .replace(/\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/gi, "[ID]").slice(0, 240);
 }
 
+let cgxV02Active = false;
 async function cgxV02Run(reason = "alarm") {
+  if (cgxV02Active) return { ok: false, status: "already_running" };
+  cgxV02Active = true;
+  try {
   const { state, indexReady } = await cgxV02Read();
   const now = Date.now();
   if (!state.enabled) return { ok: false, status: "disabled" };
@@ -121,6 +125,8 @@ async function cgxV02Run(reason = "alarm") {
     return { ok: true, status: "not_due" };
   }
   if (state.lastAttemptAt && now - state.lastAttemptAt < CGX_V02_RETRY_GUARD_MS) {
+    state.nextDueAt = cgxV02NextBeijing2345(now);
+    await cgxV02Write(state);
     await cgxV02Arm(state);
     return { ok: false, status: "retry_guard" };
   }
@@ -170,6 +176,9 @@ async function cgxV02Run(reason = "alarm") {
     state.lastError = cgxV02ShortError(error);
     await cgxV02Write(state);
     return { ok: false, status: "failed", error: state.lastError };
+  }
+  } finally {
+    cgxV02Active = false;
   }
 }
 
