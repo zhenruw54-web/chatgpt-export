@@ -150,11 +150,26 @@ async function cgxV02AwaitZip(message, sender) {
     cgxV02TrackedByUrl.delete(record.url);
   }
 }
+async function cgxV02AbortZip(message, sender) {
+  if (!cgxV02DownloadSenderValid(sender))
+    return {ok:false,error:"Unauthorized ZIP cleanup request."};
+  const record = cgxV02Tracked.get(message.token);
+  if (!record || record.tabId !== sender.tab.id)
+    return {ok:true,alreadyReleased:true};
+  cgxV02FinishDownload(record, {ok:false,error:"Scheduled ZIP abandoned before confirmation."});
+  cgxV02Tracked.delete(message.token);
+  cgxV02TrackedByUrl.delete(record.url);
+  // Do not delete a browser download here; preserving user data is safer.
+  return {ok:true};
+}
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || !["cgx-v02-watch-zip","cgx-v02-await-zip"].includes(message.type))
+  if (!message || !["cgx-v02-watch-zip","cgx-v02-await-zip",
+    "cgx-v02-abort-zip"].includes(message.type))
     return false;
   const promise = message.type === "cgx-v02-watch-zip" ?
-    cgxV02WatchZip(message, sender) : cgxV02AwaitZip(message, sender);
+    cgxV02WatchZip(message, sender) :
+    message.type === "cgx-v02-await-zip" ?
+    cgxV02AwaitZip(message, sender) : cgxV02AbortZip(message, sender);
   promise.then(sendResponse).catch(e => sendResponse({
     ok:false,error:cgxV02DownloadError(e)
   }));
