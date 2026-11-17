@@ -34,6 +34,9 @@ const CGX_V02_KEY = "cgx-v02-scheduler";
 const CGX_V02_ALARM = "cgx-v02-daily-2345-beijing";
 const CGX_V02_TIMEZONE = "Asia/Shanghai";
 const CGX_V02_RETRY_GUARD_MS = 60 * 60 * 1000;
+const CGX_V02_RECEIPT_KEY = "cgx-v02-index-migration";
+const CGX_V02_EXPECTED_BASELINE_COUNT = 65;
+const CGX_V02_MAX_TRANSFER_CHARS = 512 * 1024;
 
 function cgxV02NextBeijing2345(afterMs) {
   const parts = Object.fromEntries(
@@ -48,9 +51,12 @@ function cgxV02NextBeijing2345(afterMs) {
 }
 
 async function cgxV02Read() {
-  const result = await api.storage.local.get([CGX_V02_KEY, "cgx-export-index"]);
+  const result = await api.storage.local.get([CGX_V02_KEY, "cgx-export-index", CGX_V02_RECEIPT_KEY]);
   const state = result[CGX_V02_KEY] || {};
   const index = result["cgx-export-index"];
+  const receipt = result[CGX_V02_RECEIPT_KEY];
+  // A bare index is never treated as a verified migrated baseline.
+  const indexReady = cgxV02ReceiptCoversIndex(index, receipt);
   return {
     state: {
       enabled: state.enabled === true,
@@ -60,7 +66,127 @@ async function cgxV02Read() {
       lastStatus: String(state.lastStatus || "disabled"),
       lastError: String(state.lastError || "").slice(0, 240)
     },
-    indexReady: !!(index && typeof index === "object" && !Array.isArray(index) && Object.keys(index).length)
+    indexReady,
+    migration: receipt && receipt.schema === "cgx-v02-receipt-v1" ? {
+      importedAt: receipt.importedAt,
+      baselineCount: receipt.baselineIds?.length || 0,
+      indexCountAtImport: receipt.indexCountAtImport || 0,
+      currentIndexCount: index && typeof index === "object" ? Object.keys(index).length : 0
+    } : null
+  };
+}
+
+
+function cgxV02IsPlainObject(x) {
+  return x !== null && typeof x === "object" && !Array.isArray(x) &&
+    (Object.getPrototypeOf(x) === Object.prototype || Object.getPrototypeOf(x) === null);
+}
+
+function cgxV02ExtractConversationId(key) {
+  if (typeof key !== "string" || key.length > 300) return null;
+  const at = key.lastIndexOf(":");
+  if (at < 1 || at >= key.length - 1) return null;
+  const id = key.slice(at + 1);
+  // Supports UUID and non-UUID conversation IDs without accepting paths or URLs.
+  return /^[A-Za-z0-9_-]{8,160}$/.test(id) ? id : null;
+}
+
+function cgxV02ReceiptCoversIndex(index, receipt) {
+  if (!cgxV02IsPlainObject(index) || !cgxV02IsPlainObject(receipt)) return false;
+  if (receipt.schema !== "cgx-v02-receipt-v1" || receipt.verified !== true) return false;
+  if (!Array.isArray(receipt.baselineIds) ||
+      receipt.baselineIds.length !== CGX_V02_EXPECTED_BASELINE_COUNT) return false;
+  const keys = Object.keys(index);
+  if (keys.length < receipt.indexCountAtImport ||
+      keys.length < receipt.baselineIds.length) return false;
+  const ids = new Set(keys.map(cgxV02ExtractConversationId).filter(Boolean));
+  return receipt.baselineIds.every(id => typeof id === "string" && ids.has(id));
+}
+
+function cgxV02ValidateTransfer(message) {
+  const source = message && message.source;
+  const baseline = message && message.baseline;
+  if (!cgxV02IsPlainObject(source) ||
+      source.schema !== "cgx-index-transfer-v1")
+    throw new Error("Expected a cgx-index-transfer-v1 file from the original extension.");
+  if (!cgxV02IsPlainObject(baseline) ||
+      baseline.schema !== "cgx-v01-baseline-v1")
+    throw new Error("Expected a cgx-v01-baseline-v1 file from the frozen V0.1 baseline.");
+
+  const index = source.index;
+  if (!cgxV02IsPlainObject(index)) throw new Error("Index must be a JSON object.");
+  const keys = Object.keys(index);
+  if (keys.length < CGX_V02_EXPECTED_BASELINE_COUNT || keys.length > 100000)
+    throw new Error("Original index count does not cover the 65-conversation V0.1 baseline.");
+  for (const key of keys) {
+    if (!cgxV02ExtractConversationId(key)) throw new Error("Index contains invalid conversation IDs.");
+    const item = index[key];
+    if (!cgxV02IsPlainObject(item) ||
+        typeof item.fingerprint !== "string" ||
+        !/^[a-f0-9]{64}$/i.test(item.fingerprint))
+      throw new Error("Index includes an invalid SHA-256 conversation fingerprint.");
+    if (item.updated_at != null &&
+        !["string", "number"].includes(typeof item.updated_at))
+      throw new Error("Invalid updated_at in source index.");
+  }
+
+  const ids = baseline.conversation_ids;
+  if (!Array.isArray(ids) || ids.length !== CGX_V02_EXPECTED_BASELINE_COUNT)
+    throw new Error("V0.1 baseline must provide exactly 65 conversation IDs.");
+  if (new Set(ids).size !== ids.length ||
+      !ids.every(id => typeof id === "string" && /^[A-Za-z0-9_-]{8,160}$/.test(id)))
+    throw new Error("V0.1 baseline IDs contain duplicates or invalid values.");
+
+  const last = source.last_full_export;
+  if (!Number.isFinite(last) || last < 1600000000000 || last > Date.now() + 86400000)
+    throw new Error("Original extension last full export timestamp is missing or invalid.");
+  const present = new Set(keys.map(cgxV02ExtractConversationId));
+  const missing = ids.filter(id => !present.has(id));
+  if (missing.length)
+    throw new Error("Source index is missing " + missing.length +
+      " of the 65 V0.1 conversation IDs. No migration was performed.");
+
+  return {
+    index,
+    receipt: {
+      schema: "cgx-v02-receipt-v1",
+      verified: true,
+      importedAt: new Date().toISOString(),
+      indexCountAtImport: keys.length,
+      lastFullExportAtImport: last,
+      baselineIds: ids.slice()
+    },
+    last
+  };
+}
+
+async function cgxV02ImportIndex(message) {
+  // Payload stays inside the current Edge extension, never leaves for a server.
+  if (JSON.stringify(message).length > CGX_V02_MAX_TRANSFER_CHARS)
+    throw new Error("Migration data is too large. Expected only small JSON index files.");
+  const { state } = await cgxV02Read();
+  if (state.enabled || cgxV02Active)
+    throw new Error("Turn off the scheduler before importing an index.");
+
+  const current = await api.storage.local.get(["cgx-export-index", CGX_V02_RECEIPT_KEY]);
+  if (current["cgx-export-index"] || current[CGX_V02_RECEIPT_KEY])
+    throw new Error("Target index already exists. Refusing to overwrite it.");
+
+  const { index, receipt, last } = cgxV02ValidateTransfer(message);
+  await api.storage.local.set({
+    "cgx-export-index": index,
+    "cgx-last-full-export": last,
+    [CGX_V02_RECEIPT_KEY]: receipt
+  });
+  const after = await cgxV02Read();
+  if (!after.indexReady)
+    throw new Error("Migration could not be read back correctly. Keep auto-export disabled.");
+  return {
+    ok: true, importedEntries: receipt.indexCountAtImport,
+    matchedBaselineIds: receipt.baselineIds.length,
+    status: "migrated_and_verified_locally",
+    // Do not return the conversation identifiers to the popup.
+    indexReady: after.indexReady
   };
 }
 
@@ -201,8 +327,17 @@ api.alarms.onAlarm.addListener(alarm => {
 // Only explicit popup control may enable the schedule. It is additionally
 // blocked when no migrated index exists, preventing a surprise 4+ GiB export.
 api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || !["cgx-v02-get", "cgx-v02-set", "cgx-v02-run-now"].includes(message.type)) return false;
+  if (!message || !["cgx-v02-get", "cgx-v02-set", "cgx-v02-run-now", "cgx-v02-import-index"].includes(message.type)) return false;
   (async () => {
+    if (message.type !== "cgx-v02-get") {
+      // Only the extension's own popup may import baselines or control schedules.
+      const trustedUrl = "chrome-extension://" + api.runtime.id + "/popup/popup.html";
+      if (!_sender || _sender.url !== trustedUrl)
+        return { ok: false, error: "Only the extension popup may change V0.2 settings." };
+    }
+    if (message.type === "cgx-v02-import-index") {
+      return cgxV02ImportIndex(message);
+    }
     if (message.type === "cgx-v02-get") {
       const data = await cgxV02Read();
       return { ok: true, ...data, timezone: CGX_V02_TIMEZONE };
