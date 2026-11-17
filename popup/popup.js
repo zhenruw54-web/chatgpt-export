@@ -732,3 +732,50 @@ updateFormatUI();
 checkPermission();
 restoreDiagnosticLog();
 init();
+
+
+// V0.2 opt-in schedule; a freshly forked extension has no old incremental
+// index. Keep the switch unavailable until the index is safely migrated.
+async function cgxV02InitUI() {
+  const enabled = $("cgx-v02-enabled");
+  const info = $("cgx-v02-status");
+  if (!enabled || !info) return;
+  function showState(data) {
+    const state = data.state || {};
+    enabled.checked = !!state.enabled;
+    enabled.disabled = !data.indexReady;
+    if (!data.indexReady) {
+      info.textContent = "尚未检测到旧版增量索引。自动采集已锁定，避免重新下载全部历史。";
+      return;
+    }
+    const due = state.nextDueAt ? new Date(state.nextDueAt).toLocaleString("zh-CN", {timeZone:"Asia/Shanghai"}) : "未设置";
+    info.textContent = state.enabled
+      ? "已开启；下次计划：" + due + "（北京时间）；上次状态：" + (state.lastStatus || "无")
+      : "历史基线已存在；自动采集当前关闭。";
+    if (state.lastError) info.textContent += "；错误：" + state.lastError;
+  }
+  async function refresh() {
+    try {
+      const response = await api.runtime.sendMessage({type:"cgx-v02-get"});
+      if (!response?.ok) throw new Error(response?.error || "状态读取失败");
+      showState(response);
+    } catch (error) {
+      enabled.disabled = true;
+      info.textContent = "无法读取定时任务状态：" + String(error?.message || error);
+    }
+  }
+  enabled.addEventListener("change", async () => {
+    enabled.disabled = true;
+    try {
+      const response = await api.runtime.sendMessage({
+        type:"cgx-v02-set", enabled:!!enabled.checked
+      });
+      if (!response?.ok) throw new Error(response?.error || "保存失败");
+    } catch (error) {
+      info.textContent = String(error?.message || error);
+    }
+    await refresh();
+  });
+  await refresh();
+}
+cgxV02InitUI();
