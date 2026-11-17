@@ -27,6 +27,138 @@ api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 
+// CGX_V02_DOWNLOAD_TRACKER
+// Browser completion is the FIRST receipt only: it is not V0.1/ZIP validation.
+// A service-worker crash deliberately loses in-flight acknowledgements. The
+// content script then must NOT advance its index, even if a ZIP was written.
+// This favors a possible duplicate download over silently missing knowledge.
+const CGX_V02_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+const cgxV02Tracked = new Map();
+const cgxV02TrackedByUrl = new Map();
+function cgxV02DownloadError(err) {
+  return String(err?.message || err || "Download failed").slice(0, 180);
+}
+function cgxV02DownloadSenderValid(sender) {
+  if (!sender || sender.id !== api.runtime.id ||
+      !Number.isInteger(sender.tab?.id) || sender.tab.id < 0) return false;
+  try {
+    const u = new URL(sender.url || "");
+    return u.protocol === "https:" &&
+      (u.hostname === "chatgpt.com" || u.hostname === "chat.openai.com");
+  } catch (_) { return false; }
+}
+function cgxV02FinishDownload(record, outcome) {
+  if (record.terminal) return;
+  record.terminal = outcome;
+  if (record.resolve) record.resolve(outcome);
+}
+async function cgxV02ValidateDownloadItem(record, id) {
+  const matches = await api.downloads.search({ id });
+  const item = matches && matches[0];
+  if (!item || item.id !== id || item.state !== "complete" ||
+      item.url !== record.url || !/\.zip$/i.test(item.filename || ""))
+    throw new Error("Completed ZIP download could not be matched to the tracked blob.");
+  // Chrome may report -1 for unknown size. A reported positive size must
+  // match; a reported zero for a nonempty blob is never valid.
+  for (const n of [item.fileSize, item.bytesReceived]) {
+    if (typeof n === "number" && n >= 0 && n !== record.expectedBytes)
+      throw new Error("Downloaded ZIP byte count differs from in-memory ZIP.");
+  }
+  return { ok: true, status: "browser_download_complete", byteCount: record.expectedBytes };
+}
+if (api.downloads?.onCreated?.addListener &&
+    api.downloads?.onChanged?.addListener && api.downloads?.search) {
+  api.downloads.onCreated.addListener(item => {
+    if (!item?.url || !cgxV02TrackedByUrl.has(item.url)) return;
+    const token = cgxV02TrackedByUrl.get(item.url);
+    const record = cgxV02Tracked.get(token);
+    if (!record || record.terminal || record.downloadId != null) return;
+    if (item.tabId != null && item.tabId >= 0 && item.tabId !== record.tabId) return;
+    record.downloadId = item.id;
+    if (item.state === "interrupted") {
+      cgxV02FinishDownload(record, { ok: false, error: "ZIP download interrupted." });
+    } else if (item.state === "complete") {
+      cgxV02ValidateDownloadItem(record, item.id).then(
+        result => cgxV02FinishDownload(record, result),
+        error => cgxV02FinishDownload(record, {ok:false,error:cgxV02DownloadError(error)})
+      );
+    }
+  });
+  api.downloads.onChanged.addListener(delta => {
+    if (!delta?.state || !["complete", "interrupted"].includes(delta.state.current)) return;
+    const record = [...cgxV02Tracked.values()].find(
+      r => r.downloadId === delta.id && !r.terminal
+    );
+    if (!record) return;
+    if (delta.state.current === "interrupted") {
+      cgxV02FinishDownload(record, {ok:false,error:"ZIP download interrupted."});
+      return;
+    }
+    cgxV02ValidateDownloadItem(record, delta.id).then(
+      result => cgxV02FinishDownload(record, result),
+      error => cgxV02FinishDownload(record, {ok:false,error:cgxV02DownloadError(error)})
+    );
+  });
+}
+async function cgxV02WatchZip(message, sender) {
+  if (!cgxV02Active || !cgxV02DownloadSenderValid(sender) ||
+      !api.downloads?.search || !api.downloads?.onCreated)
+    return {ok:false,error:"Scheduled download tracker is unavailable or unauthorized."};
+  const {url, filename, expectedBytes} = message;
+  if (typeof url !== "string" || url.length > 350 ||
+      !/^blob:https:\/\/(?:chatgpt\.com|chat\.openai\.com)\/[A-Za-z0-9-]+$/.test(url) ||
+      typeof filename !== "string" ||
+      !/^chatgpt-export_[A-Za-z0-9_-]+(?:_part-\d{3})?\.zip$/.test(filename) ||
+      !Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 ||
+      expectedBytes > 2 * 1024 * 1024 * 1024 ||
+      cgxV02TrackedByUrl.has(url) || cgxV02Tracked.size >= 10)
+    return {ok:false,error:"Invalid scheduled ZIP registration; download not started."};
+  const token = crypto.randomUUID();
+  const record = {
+    token, url, filename, expectedBytes, tabId: sender.tab.id,
+    downloadId: null, terminal: null, resolve: null, pending: null,
+    createdAt: Date.now()
+  };
+  cgxV02Tracked.set(token, record);
+  cgxV02TrackedByUrl.set(url, token);
+  return {ok:true,token};
+}
+async function cgxV02AwaitZip(message, sender) {
+  if (!cgxV02DownloadSenderValid(sender)) {
+    return {ok:false,error:"Unauthorized ZIP confirmation request."};
+  }
+  const record = cgxV02Tracked.get(message.token);
+  if (!record || record.tabId !== sender.tab.id) {
+    return {ok:false,error:"ZIP session missing (worker may have restarted). Index unchanged."};
+  }
+  let timeout;
+  try {
+    if (record.terminal) return record.terminal;
+    if (!record.pending) record.pending = new Promise(resolve => { record.resolve = resolve; });
+    const result = await Promise.race([
+      record.pending,
+      new Promise(resolve => { timeout=setTimeout(() => resolve({
+        ok:false,error:"No browser download completion receipt before timeout; index unchanged."
+      }), CGX_V02_DOWNLOAD_TIMEOUT_MS); })
+    ]);
+    return result;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    cgxV02Tracked.delete(message.token);
+    cgxV02TrackedByUrl.delete(record.url);
+  }
+}
+api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || !["cgx-v02-watch-zip","cgx-v02-await-zip"].includes(message.type))
+    return false;
+  const promise = message.type === "cgx-v02-watch-zip" ?
+    cgxV02WatchZip(message, sender) : cgxV02AwaitZip(message, sender);
+  promise.then(sendResponse).catch(e => sendResponse({
+    ok:false,error:cgxV02DownloadError(e)
+  }));
+  return true;
+});
+
 // V0.2 Edge scheduler (opt-in; disabled by default).  The export engine stays
 // in the existing ChatGPT content script; this worker only schedules it.
 // Never attempt the first automatic export without a migrated incremental index.
