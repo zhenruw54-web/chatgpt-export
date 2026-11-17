@@ -70,6 +70,7 @@ async function cgxV02Read() {
     migration: receipt && receipt.schema === "cgx-v02-receipt-v1" ? {
       importedAt: receipt.importedAt,
       baselineCount: receipt.baselineIds?.length || 0,
+      verifiedSharedAliases: receipt.sharedAliases?.length || 0,
       indexCountAtImport: receipt.indexCountAtImport || 0,
       currentIndexCount: index && typeof index === "object" ? Object.keys(index).length : 0
     } : null
@@ -95,12 +96,100 @@ function cgxV02ReceiptCoversIndex(index, receipt) {
   if (!cgxV02IsPlainObject(index) || !cgxV02IsPlainObject(receipt)) return false;
   if (receipt.schema !== "cgx-v02-receipt-v1" || receipt.verified !== true) return false;
   if (!Array.isArray(receipt.baselineIds) ||
-      receipt.baselineIds.length !== CGX_V02_EXPECTED_BASELINE_COUNT) return false;
+      receipt.baselineIds.length !== CGX_V02_EXPECTED_BASELINE_COUNT ||
+      new Set(receipt.baselineIds).size !== CGX_V02_EXPECTED_BASELINE_COUNT) return false;
   const keys = Object.keys(index);
-  if (keys.length < receipt.indexCountAtImport ||
+  if (!Number.isInteger(receipt.indexCountAtImport) ||
+      keys.length < receipt.indexCountAtImport ||
       keys.length < receipt.baselineIds.length) return false;
   const ids = new Set(keys.map(cgxV02ExtractConversationId).filter(Boolean));
-  return receipt.baselineIds.every(id => typeof id === "string" && ids.has(id));
+  const aliases = Array.isArray(receipt.sharedAliases) ? receipt.sharedAliases : [];
+  if (aliases.length > 2) return false;
+  const map = new Map();
+  const usedKeys = new Set();
+  for (const record of aliases) {
+    if (!cgxV02IsPlainObject(record) || typeof record.targetId !== "string" ||
+        typeof record.sourceIndexKey !== "string" ||
+        !receipt.baselineIds.includes(record.targetId) ||
+        !Object.prototype.hasOwnProperty.call(index, record.sourceIndexKey) ||
+        !cgxV02ExtractConversationId(record.sourceIndexKey) ||
+        usedKeys.has(record.sourceIndexKey) || map.has(record.targetId)) return false;
+    const current = index[record.sourceIndexKey];
+    if (!cgxV02IsPlainObject(current) || typeof current.fingerprint !== "string" ||
+        !/^[a-f0-9]{64}$/i.test(current.fingerprint) ||
+        ids.has(record.targetId)) return false; // No conflicting direct key.
+    usedKeys.add(record.sourceIndexKey);
+    map.set(record.targetId, record.sourceIndexKey);
+  }
+  // Exact coverage with zero false matches: all 65 are either directly indexed
+  // or linked to a specific verified shared-list key; never add synthetic keys.
+  if (!receipt.baselineIds.every(id => ids.has(id) || map.has(id))) return false;
+  // Imported aliased keys must remain distinct from the direct 63/65 entries.
+  const directKeys = keys.filter(k => receipt.baselineIds.includes(cgxV02ExtractConversationId(k)));
+  return !directKeys.some(k => usedKeys.has(k));
+}
+
+// This proof is a minimal, local extraction of TWO verified raw/metadata pairs.
+// It does NOT cryptographically authenticate source ZIPs by itself. Work must
+// first establish provenance by matching file hashes against the original ZIP
+// and the recorded 2x2 fingerprint/workspace/timestamp evidence.
+function cgxV02ValidateSharedAliases(index, baselineIds, proof) {
+  const keys = Object.keys(index);
+  const direct = new Set(keys.map(cgxV02ExtractConversationId).filter(Boolean));
+  const missing = baselineIds.filter(id => !direct.has(id));
+  if (!missing.length) {
+    if (proof != null && !(cgxV02IsPlainObject(proof) &&
+        proof.schema === "cgx-v02-shared-alias-proof-v1" &&
+        Array.isArray(proof.mappings) && proof.mappings.length === 0))
+      throw new Error("Unexpected shared-alias proof; all 65 IDs already match directly.");
+    return [];
+  }
+  if (missing.length !== 2)
+    throw new Error("Migration has " + missing.length +
+      " missing baseline IDs; only the two locally verified shared aliases are supported.");
+  if (!cgxV02IsPlainObject(proof) ||
+      proof.schema !== "cgx-v02-shared-alias-proof-v1" ||
+      !Array.isArray(proof.mappings) || proof.mappings.length !== 2)
+    throw new Error("Two source-backed shared identity mappings are required. No index was changed.");
+  const extraKeys = keys.filter(key => !baselineIds.includes(cgxV02ExtractConversationId(key)));
+  if (extraKeys.length !== 2)
+    throw new Error("Old index contains additional unmapped identities; manual review required.");
+
+  const mapped = [];
+  const seenIds = new Set();
+  const seenKeys = new Set();
+  for (const p of proof.mappings) {
+    if (!cgxV02IsPlainObject(p) || !cgxV02IsPlainObject(p.raw) ||
+        !cgxV02IsPlainObject(p.metadata) || !cgxV02IsPlainObject(p.index))
+      throw new Error("Invalid shared alias evidence structure.");
+    const target = p.raw.conversation_id;
+    const key = p.index.key;
+    const oldId = cgxV02ExtractConversationId(key);
+    if (typeof target !== "string" || !missing.includes(target) ||
+        seenIds.has(target) || !extraKeys.includes(key) || seenKeys.has(key))
+      throw new Error("Shared alias evidence is missing, duplicated, or conflicts with a direct ID.");
+    if (p.raw.backing_conversation_id !== oldId ||
+        p.metadata.conversation_id !== target ||
+        p.raw.workspace_id !== p.metadata.workspace_id ||
+        typeof p.raw.workspace_id !== "string" || !p.raw.workspace_id ||
+        p.index.workspace_id !== p.raw.workspace_id)
+      throw new Error("Shared alias fields disagree with raw/metadata workspace or backing ID.");
+    if (!cgxV02IsPlainObject(index[key]) ||
+        p.index.fingerprint !== index[key].fingerprint ||
+        p.index.updated_at !== index[key].updated_at)
+      throw new Error("Shared alias index fingerprint/timestamp does not match the original index.");
+    if (typeof p.raw_sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/i.test(p.raw_sha256) ||
+        typeof p.metadata_sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/i.test(p.metadata_sha256))
+      throw new Error("Shared proof must provide SHA-256 of the two source files.");
+    seenIds.add(target);
+    seenKeys.add(key);
+    mapped.push({ targetId: target, sourceIndexKey: key });
+  }
+  if (seenIds.size !== 2 || seenKeys.size !== 2)
+    throw new Error("Shared alias proof must form a unique two-to-two mapping.");
+  return mapped;
 }
 
 function cgxV02ValidateTransfer(message) {
@@ -140,11 +229,13 @@ function cgxV02ValidateTransfer(message) {
   const last = source.last_full_export;
   if (!Number.isFinite(last) || last < 1600000000000 || last > Date.now() + 86400000)
     throw new Error("Original extension last full export timestamp is missing or invalid.");
-  const present = new Set(keys.map(cgxV02ExtractConversationId));
-  const missing = ids.filter(id => !present.has(id));
-  if (missing.length)
-    throw new Error("Source index is missing " + missing.length +
-      " of the 65 V0.1 conversation IDs. No migration was performed.");
+  const sharedAliases = cgxV02ValidateSharedAliases(index, ids, message.aliasProof);
+  const validated = {
+    schema: "cgx-v02-receipt-v1", verified: true,
+    indexCountAtImport: keys.length, baselineIds: ids.slice(), sharedAliases
+  };
+  if (!cgxV02ReceiptCoversIndex(index, validated))
+    throw new Error("Combined direct/shared coverage failed. No migration was performed.");
 
   return {
     index,
@@ -154,7 +245,8 @@ function cgxV02ValidateTransfer(message) {
       importedAt: new Date().toISOString(),
       indexCountAtImport: keys.length,
       lastFullExportAtImport: last,
-      baselineIds: ids.slice()
+      baselineIds: ids.slice(),
+      sharedAliases
     },
     last
   };
@@ -184,6 +276,7 @@ async function cgxV02ImportIndex(message) {
   return {
     ok: true, importedEntries: receipt.indexCountAtImport,
     matchedBaselineIds: receipt.baselineIds.length,
+    mappedSharedAliases: receipt.sharedAliases.length,
     status: "migrated_and_verified_locally",
     // Do not return the conversation identifiers to the popup.
     indexReady: after.indexReady
