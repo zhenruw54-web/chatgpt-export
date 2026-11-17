@@ -264,6 +264,11 @@
           V0.1 已核验的65条对话ID JSON
           <input id="cgx-v02-baseline-file" type="file" accept=".json,application/json" style="width:100%;margin-top:4px">
         </label>
+        <label class="number-row" style="display:block">
+          已核实的 shared 身份映射证明（本次63/65必需）
+          <input id="cgx-v02-alias-file" type="file" accept=".json,application/json" style="width:100%;margin-top:4px">
+        </label>
+        <p class="hint">必须来自本地原始 raw.json、metadata.json 与旧索引指纹核对，不可按标题/时间猜测。</p>
         <button id="cgx-v02-import-index" type="button" disabled style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px">
           核对65条并迁移（不会覆盖旧索引）
         </button>
