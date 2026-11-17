@@ -424,6 +424,27 @@ async function cgxV02Run(reason = "alarm") {
   }
 }
 
+// Explicit read-only preview from the V0.2 popup, without scheduler enable.
+async function cgxV02PreviewNow() {
+  if (cgxV02Active) return {ok:false,error:'Another V0.2 task is running.'};
+  cgxV02Active = true;
+  try {
+    const { indexReady } = await cgxV02Read();
+    if (!indexReady) return {ok:false,error:'Verified migrated index required for preview.'};
+    const tab=await cgxV02FindTab();
+    await cgxV02WaitReceiver(tab.id);
+    const result=await api.tabs.sendMessage(tab.id,{type:'cgx-v02-preview'});
+    if (!result || result.ok!==true || !Number.isInteger(result.changed) ||
+        result.changed<0 || !Number.isInteger(result.listed) || result.listed<1)
+      return {ok:false,error:'Read-only preview did not finish safely.'};
+    return {ok:true,listed:result.listed,changed:result.changed,
+      newCount:result.newCount||0,modified:result.modified||0,
+      safeToTest:result.changed<=CGX_V02_MAX_DAILY_DELTA,
+      maxPilotDelta:CGX_V02_MAX_DAILY_DELTA};
+  } catch (error) {
+    return {ok:false,error:cgxV02ShortError(error)};
+  } finally {cgxV02Active=false;}
+}
 async function cgxV02Wake() {
   const { state } = await cgxV02Read();
   if (!state.enabled) return cgxV02Arm(state);
@@ -443,7 +464,7 @@ api.alarms.onAlarm.addListener(alarm => {
 // Only explicit popup control may enable the schedule. It is additionally
 // blocked when no migrated index exists, preventing a surprise 4+ GiB export.
 api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || !["cgx-v02-get", "cgx-v02-set", "cgx-v02-run-now", "cgx-v02-import-index"].includes(message.type)) return false;
+  if (!message || !["cgx-v02-get", "cgx-v02-set", "cgx-v02-run-now", "cgx-v02-import-index", "cgx-v02-preview-now"].includes(message.type)) return false;
   (async () => {
     if (message.type !== "cgx-v02-get") {
       // Only the extension's own popup may import baselines or control schedules.
@@ -454,6 +475,7 @@ api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "cgx-v02-import-index") {
       return cgxV02ImportIndex(message);
     }
+    if (message.type === "cgx-v02-preview-now") return cgxV02PreviewNow();
     if (message.type === "cgx-v02-get") {
       const data = await cgxV02Read();
       return { ok: true, ...data, timezone: CGX_V02_TIMEZONE };
