@@ -252,6 +252,24 @@
     </label>
     <p id="cgx-v02-status" class="hint" role="status">正在检查历史基线…</p>
     <p class="hint">不会删除对话；新扩展必须先迁移并核验旧增量索引，避免重复下载完整历史。</p>
+    <details id="cgx-v02-migration" style="margin-top:8px">
+      <summary>一次性迁移旧扩展索引（本地操作）</summary>
+      <div class="group">
+        <p class="hint">只选择两个小型 JSON 文件，不上传历史 ZIP，也不发送到网络。</p>
+        <label class="number-row" style="display:block;margin-top:10px">
+          原扩展增量索引 JSON
+          <input id="cgx-v02-source-file" type="file" accept=".json,application/json" style="width:100%;margin-top:4px">
+        </label>
+        <label class="number-row" style="display:block">
+          V0.1 已核验的65条对话ID JSON
+          <input id="cgx-v02-baseline-file" type="file" accept=".json,application/json" style="width:100%;margin-top:4px">
+        </label>
+        <button id="cgx-v02-import-index" type="button" disabled style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px">
+          核对65条并迁移（不会覆盖旧索引）
+        </button>
+        <p id="cgx-v02-import-result" class="hint" role="status"></p>
+      </div>
+    </details>
   </section>
 
   <footer>
