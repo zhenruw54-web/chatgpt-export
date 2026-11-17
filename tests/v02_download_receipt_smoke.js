@@ -78,6 +78,16 @@ async function main(){
   downloads.set(104,item("blob:https://chatgpt.com/different",104,2048));
   created(item(four.url,104,2048,"in_progress"));changed(104,"complete");
   check("wrong blob origin result rejected",!(await p4).ok);
+  const five=zip("55555555-2222-3333-4444-555555555555");
+  const t5=await call(five),p5=call({type:"cgx-v02-await-zip",token:t5.token});
+  downloads.set(105,item(five.url,105,-1));
+  created(item(five.url,105,-1,"in_progress"));changed(105,"complete");
+  check("unknown completed ZIP byte count rejected",!(await p5).ok);
+  const six=zip("66666666-2222-3333-4444-555555555555");
+  const t6=await call(six),p6=call({type:"cgx-v02-await-zip",token:t6.token});
+  downloads.set(106,item(six.url,106,2048));
+  created(item(six.url,106,2048,"complete"));
+  check("onCreated complete without onChanged is recognized",(await p6).ok);
   check("tracker never modifies historical index",!store["cgx-export-index"]);
   console.log("PASS TOTAL "+passed);
 }
