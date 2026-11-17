@@ -60,10 +60,12 @@ async function cgxV02ValidateDownloadItem(record, id) {
     throw new Error("Completed ZIP download could not be matched to the tracked blob.");
   // Chrome may report -1 for unknown size. A reported positive size must
   // match; a reported zero for a nonempty blob is never valid.
-  for (const n of [item.fileSize, item.bytesReceived]) {
-    if (typeof n === "number" && n >= 0 && n !== record.expectedBytes)
-      throw new Error("Downloaded ZIP byte count differs from in-memory ZIP.");
-  }
+  // At least one byte counter must be known and equal to our in-memory ZIP.
+  // Do NOT treat an unknown (-1) size as a successful verification.
+  const counts = [item.fileSize, item.bytesReceived]
+    .filter(n => Number.isSafeInteger(n) && n >= 0);
+  if (!counts.length || counts.some(n => n !== record.expectedBytes))
+    throw new Error("ZIP byte count unknown or differs from in-memory ZIP.");
   return { ok: true, status: "browser_download_complete", byteCount: record.expectedBytes };
 }
 if (api.downloads?.onCreated?.addListener &&
