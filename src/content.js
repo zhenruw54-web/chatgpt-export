@@ -532,6 +532,41 @@
     const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=filename;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
   }
 
+  // Scheduled ZIP only: browser MUST report download completion before any
+  // incremental index advances. Manual export still uses its old path.
+  // A timeout, crash, interrupted download or unknown receipt fails closed.
+  async function cgxV02DownloadZip(filename,blob){
+    checkCancelled();
+    if (!(blob instanceof Blob) || blob.size <= 0)
+      throw new Error('Scheduled ZIP was empty; index not updated.');
+    const url=URL.createObjectURL(blob);
+    let token=null;
+    try {
+      const registered=await api.runtime.sendMessage({
+        type:'cgx-v02-watch-zip',url,filename,expectedBytes:blob.size
+      });
+      if(!registered || registered.ok!==true || !registered.token)
+        throw new Error(registered?.error||'Cannot track scheduled ZIP download.');
+      token=registered.token;
+      const a=document.createElement('a');
+      a.href=url;
+      a.download=filename;
+      document.body.appendChild(a);
+      try { a.click(); } finally { a.remove(); }
+      const receipt=await api.runtime.sendMessage({
+        type:'cgx-v02-await-zip',token
+      });
+      if(!receipt || receipt.ok!==true || receipt.status!=='browser_download_complete')
+        throw new Error(receipt?.error||'Browser ZIP completion was not verified; index unchanged.');
+      checkCancelled();
+      return receipt;
+    } finally {
+      // Do not revoke while downloading. Even a failed or timed-out job is
+      // kept long enough for the browser to finish its own cleanup.
+      setTimeout(()=>URL.revokeObjectURL(url),30000);
+    }
+  }
+
   function exportFileStamp(){return new Date().toISOString().replace('T','_').replace(/[:.]/g,'-');}
 
   function jexId() {
@@ -1234,7 +1269,10 @@
     await addManifest(files,{schema_version:4,exported_at:new Date().toISOString(),embedded_markdown:!!opts.embeddedMd,conversation_count:index.length,failures:(meta.errors||[]).length,image_failures:meta.imageFailures||0,file_failures:meta.fileFailures||0,workspace_ids:meta.accounts||[],part:partNo,incremental_since:meta.since||null,capabilities:capabilitySnapshot()},opts.checksums);
     const stamp=exportFileStamp();const suffix=partNo>1?`_part-${String(partNo).padStart(3,'0')}`:'';
     checkCancelled();
-    checkCancelled();download(`chatgpt-export_${stamp}${suffix}.zip`,CGX_buildZip(files));
+    const name=`chatgpt-export_${stamp}${suffix}.zip`;
+    const blob=CGX_buildZip(files);
+    if(opts.v02Scheduled) await cgxV02DownloadZip(name,blob);
+    else download(name,blob);
   }
 
   // Read-only metadata preview. No ZIP, no index writes, no IDs in result.
