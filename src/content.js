@@ -1362,6 +1362,10 @@
     checkCancelled();
     progressPercent(100,'Finalizing archive…',items.length,items.length);await flush(true);
     progressPercent(100,'Saving export state…',items.length,items.length);
+    // A completed ZIP with missing attachments or failed conversations is
+    // NOT a complete knowledge snapshot. Keep the previous index intact.
+    if(opts.v02Scheduled && (totalErrors>0 || totalImageFailures>0 || totalFileFailures>0))
+      throw new Error('Partial ZIP: conversation/media failures; keep prior index and review downloaded ZIP.');
     // Scheduled storage errors must not be swallowed.
     // This is NOT proof of a durable Windows ZIP download.
     if(opts.v02Scheduled)
