@@ -744,16 +744,18 @@ async function cgxV02InitUI() {
   const baselineFile = $("cgx-v02-baseline-file");
   const importResult = $("cgx-v02-import-result");
   if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !importResult) return;
+  let baselineReady = false;
   function canImport() {
-    return !!(sourceFile.files?.length && baselineFile.files?.length && !enabled.checked);
+    return !baselineReady && !!(sourceFile.files?.length && baselineFile.files?.length && !enabled.checked);
   }
   function showState(data) {
     const state = data.state || {};
     enabled.checked = !!state.enabled;
+    baselineReady = !!data.indexReady;
     enabled.disabled = !data.indexReady;
-    importButton.disabled = data.indexReady || !canImport();
+    importButton.disabled = !canImport();
     if (!data.indexReady) {
-      info.textContent = "尚未检测到旧版增量索引。自动采集已锁定，避免重新下载全部历史。";
+      info.textContent = "旧版增量索引尚未通过核对。自动采集已锁定，避免重新下载全部历史。";
       return;
     }
     const due = state.nextDueAt ? new Date(state.nextDueAt).toLocaleString("zh-CN", {timeZone:"Asia/Shanghai"}) : "未设置";
