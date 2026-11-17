@@ -88,6 +88,12 @@ async function main(){
   downloads.set(106,item(six.url,106,2048));
   created(item(six.url,106,2048,"complete"));
   check("onCreated complete without onChanged is recognized",(await p6).ok);
+  const seven=zip("77777777-2222-3333-4444-555555555555");
+  const t7=await call(seven);
+  check("Explicit ZIP watcher abort releases active session",
+    (await call({type:"cgx-v02-abort-zip",token:t7.token})).ok);
+  check("Abort token cannot confirm ZIP",
+    !(await call({type:"cgx-v02-await-zip",token:t7.token})).ok);
   check("tracker never modifies historical index",!store["cgx-export-index"]);
   console.log("PASS TOTAL "+passed);
 }
