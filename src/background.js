@@ -37,6 +37,8 @@ const CGX_V02_RETRY_GUARD_MS = 60 * 60 * 1000;
 const CGX_V02_RECEIPT_KEY = "cgx-v02-index-migration";
 const CGX_V02_EXPECTED_BASELINE_COUNT = 65;
 const CGX_V02_MAX_TRANSFER_CHARS = 512 * 1024;
+// Conservative pilot cap: a mass metadata mismatch must never trigger full re-export.
+const CGX_V02_MAX_DAILY_DELTA = 10;
 
 function cgxV02NextBeijing2345(afterMs) {
   const parts = Object.fromEntries(
@@ -367,6 +369,27 @@ async function cgxV02Run(reason = "alarm") {
   try {
     const tab = await cgxV02FindTab();
     await cgxV02WaitReceiver(tab.id);
+    state.lastStatus = "previewing";
+    await cgxV02Write(state);
+    const preview = await api.tabs.sendMessage(tab.id, {type: "cgx-v02-preview"});
+    if (!preview || preview.ok !== true ||
+        !Number.isInteger(preview.changed) || preview.changed < 0 ||
+        !Number.isInteger(preview.listed) || preview.listed < 1)
+      throw new Error(preview?.error || "Safe delta preview failed. Export blocked.");
+    if (preview.changed > CGX_V02_MAX_DAILY_DELTA) {
+      state.lastStatus = "blocked_large_delta";
+      state.lastError = "Delta preview found " + preview.changed +
+        " changed entries; safety limit is " + CGX_V02_MAX_DAILY_DELTA +
+        ". Review migration index; no ZIP was requested.";
+      await cgxV02Write(state);
+      return {ok:false,status:state.lastStatus,changed:preview.changed};
+    }
+    if (preview.changed === 0) {
+      state.lastStatus = "no_changes";
+      state.lastError = "";
+      await cgxV02Write(state);
+      return {ok:true,status:"no_changes",changed:0};
+    }
     state.lastStatus = "running";
     await cgxV02Write(state);
     const result = await api.tabs.sendMessage(tab.id, {
@@ -382,7 +405,7 @@ async function cgxV02Run(reason = "alarm") {
     // This confirms content-script processing, NOT durable filesystem or F-drive archiving.
     if (!result || !result.ok) throw new Error(result?.error || "Export did not complete.");
     state.lastStatus = result.noChanges ? "no_changes" :
-      (result.failed || result.imageFailures || result.fileFailures ? "partial" : "export_completed_in_tab");
+      (result.failed || result.imageFailures || result.fileFailures ? "partial" : "export_started_download_unverified");
     state.lastExportCompletedAt = Date.now();
     await cgxV02Write(state);
     return {
