@@ -119,6 +119,11 @@ async function main() {
   });
   check("All 65 IDs migrate", migrated.ok && migrated.matchedBaselineIds === 65);
   check("Readback unlocks baseline gate", (await exposed.read()).indexReady === true);
+  const previewOnly = await call({type:"cgx-v02-preview-now"});
+  check("Read-only preview available without enabling timer",
+    previewOnly.ok && previewOnly.changed === 1 && previewOnly.listed === 65);
+  check("Read-only preview never requests ZIP export",
+    !sent.some(x => x.message.type === "cgx-v02-auto-export"));
 
   const again = await call({
     type: "cgx-v02-import-index", source: sourceFile, baseline: baselineFile
