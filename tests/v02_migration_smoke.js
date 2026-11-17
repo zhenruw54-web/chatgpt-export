@@ -16,6 +16,7 @@ async function main() {
   const alarms = Object.create(null);
   const listeners = { message: [], alarms: [] };
   const sent = [];
+  const preview = { ok: true, listed: 65, changed: 1, newCount: 1, modified: 0, baselineEntries: 65 };
   const api = {
     runtime: {
       id: "test-extension",
@@ -46,6 +47,7 @@ async function main() {
       async sendMessage(id, message) {
         sent.push({ id, message });
         if (message.type === "cgx-ping") return { ok: true };
+        if (message.type === "cgx-v02-preview") return { ...preview };
         if (message.type === "cgx-v02-auto-export")
           return { ok: true, count: 1, failed: 0, parts: 1, imageFailures: 0, fileFailures: 0 };
         throw new Error("Unexpected tab message");
@@ -222,6 +224,22 @@ async function main() {
     JSON.stringify(db["cgx-export-index"]) === JSON.stringify(oldIndex));
   check("Shared alias receipt revalidates after import",
     (await exposed.read()).indexReady === true);
+  const sharedEnabled = await call({type:"cgx-v02-set",enabled:true});
+  check("Schedule enables only after valid shared receipt", sharedEnabled.ok === true);
+  let exportBefore = sent.filter(s => s.message.type==="cgx-v02-auto-export").length;
+  preview.changed = 65;
+  const largeDelta = await exposed.run("manual");
+  check("Mass metadata mismatch is blocked before export",
+    !largeDelta.ok && largeDelta.status === "blocked_large_delta" &&
+    sent.filter(s => s.message.type==="cgx-v02-auto-export").length === exportBefore);
+  db["cgx-v02-scheduler"].lastAttemptAt=0;
+  preview.changed=0;
+  const noChanges=await exposed.run("manual");
+  check("No-change preview never downloads",
+    noChanges.ok && noChanges.status === "no_changes" &&
+    sent.filter(s => s.message.type==="cgx-v02-auto-export").length === exportBefore);
+  check("Preview does not mutate old index",
+    JSON.stringify(db["cgx-export-index"]) === JSON.stringify(oldIndex));
   const damaged = { ...oldIndex };
   delete damaged["workspace-1:" + sharedPairs[0].backing];
   db["cgx-export-index"] = toRealm(damaged);
