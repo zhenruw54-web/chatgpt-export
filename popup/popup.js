@@ -739,11 +739,19 @@ init();
 async function cgxV02InitUI() {
   const enabled = $("cgx-v02-enabled");
   const info = $("cgx-v02-status");
-  if (!enabled || !info) return;
+  const importButton = $("cgx-v02-import-index");
+  const sourceFile = $("cgx-v02-source-file");
+  const baselineFile = $("cgx-v02-baseline-file");
+  const importResult = $("cgx-v02-import-result");
+  if (!enabled || !info || !importButton || !sourceFile || !baselineFile || !importResult) return;
+  function canImport() {
+    return !!(sourceFile.files?.length && baselineFile.files?.length && !enabled.checked);
+  }
   function showState(data) {
     const state = data.state || {};
     enabled.checked = !!state.enabled;
     enabled.disabled = !data.indexReady;
+    importButton.disabled = data.indexReady || !canImport();
     if (!data.indexReady) {
       info.textContent = "尚未检测到旧版增量索引。自动采集已锁定，避免重新下载全部历史。";
       return;
@@ -773,6 +781,35 @@ async function cgxV02InitUI() {
       if (!response?.ok) throw new Error(response?.error || "保存失败");
     } catch (error) {
       info.textContent = String(error?.message || error);
+    }
+    await refresh();
+  });
+  function updateImportButton() {
+    importButton.disabled = !canImport();
+  }
+  sourceFile.addEventListener("change", updateImportButton);
+  baselineFile.addEventListener("change", updateImportButton);
+  importButton.addEventListener("click", async () => {
+    importButton.disabled = true;
+    importResult.textContent = "正在本地验证两份索引文件…";
+    try {
+      const first = sourceFile.files?.[0];
+      const second = baselineFile.files?.[0];
+      if (!first || !second || first.size > 512 * 1024 || second.size > 512 * 1024)
+        throw new Error("请选择两个各不超过512KB的JSON文件。");
+      const source = JSON.parse(await first.text());
+      const baseline = JSON.parse(await second.text());
+      const result = await api.runtime.sendMessage({
+        type: "cgx-v02-import-index", source, baseline
+      });
+      if (!result?.ok) throw new Error(result?.error || "迁移失败");
+      importResult.textContent =
+        "本地索引核验成功：" + result.matchedBaselineIds + "条基线已匹配，" +
+        result.importedEntries + "条旧扩展记录已迁移。现在可以单独测试增量功能。";
+      sourceFile.value = "";
+      baselineFile.value = "";
+    } catch (error) {
+      importResult.textContent = "未执行迁移：" + String(error?.message || error);
     }
     await refresh();
   });
