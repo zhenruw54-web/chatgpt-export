@@ -139,6 +139,10 @@ async function main() {
   check("Scheduler enabled only after migration", enabled.ok && enabled.indexReady);
   const exported = await exposed.run("manual");
   check("Manual scheduled export starts", exported.ok && exported.count === 1);
+  const immediateRetry = await exposed.run("manual");
+  check("One-hour retry guard prevents immediate repeated export",
+    !immediateRetry.ok && immediateRetry.status === "retry_guard" &&
+    sent.filter(x => x.message.type === "cgx-v02-auto-export").length === 1);
   const request = sent.find(x => x.message.type === "cgx-v02-auto-export");
   check("No deletion; incremental ZIP with media and JSON",
     request && request.message.options.incremental === true &&
@@ -164,6 +168,9 @@ async function main() {
   delete db["cgx-export-index"];
   delete db["cgx-v02-index-migration"];
   delete db["cgx-last-full-export"];
+  // This is a separate synthetic V0.2 installation. A previous scenario's
+  // lastAttemptAt must never leak into the new 63+2 migration fixture.
+  delete db["cgx-v02-scheduler"];
   const sharedPairs = [
     { target: ids[63], backing: "shared-00000001" },
     { target: ids[64], backing: "shared-00000002" }
@@ -232,10 +239,16 @@ async function main() {
   const sharedEnabled = await call({type:"cgx-v02-set",enabled:true});
   check("Schedule enables only after valid shared receipt", sharedEnabled.ok === true);
   let exportBefore = sent.filter(s => s.message.type==="cgx-v02-auto-export").length;
+  check("Fresh 63+2 fixture has no previous retry-guard timestamp",
+    !(db["cgx-v02-scheduler"].lastAttemptAt > 0));
   preview.changed = 65;
   const largeDelta = await exposed.run("manual");
   check("Mass metadata mismatch is blocked before export",
     !largeDelta.ok && largeDelta.status === "blocked_large_delta" &&
+    sent.filter(s => s.message.type==="cgx-v02-auto-export").length === exportBefore);
+  const guardedRetry = await exposed.run("manual");
+  check("Large delta cannot bypass one-hour retry guard by repeated click",
+    !guardedRetry.ok && guardedRetry.status === "retry_guard" &&
     sent.filter(s => s.message.type==="cgx-v02-auto-export").length === exportBefore);
   db["cgx-v02-scheduler"].lastAttemptAt=0;
   preview.changed=0;
