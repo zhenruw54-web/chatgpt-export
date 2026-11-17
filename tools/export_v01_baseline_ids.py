@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import quote
 
@@ -29,12 +30,18 @@ def open_readonly(db_path: Path) -> sqlite3.Connection:
     # SQLite URI with mode=ro; never creates a new database.
     url = "file:" + quote(str(db_path.resolve()).replace("\\", "/"), safe="/:") + "?mode=ro"
     conn = sqlite3.connect(url, uri=True, timeout=5)
-    conn.execute("PRAGMA query_only=ON")
-    return conn
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def verify_baseline(db_path: Path) -> dict:
-    with open_readonly(db_path) as conn:
+    # sqlite3.Connection.__exit__ commits/rolls back but does NOT close.
+    # Explicit closing is required for Windows TemporaryDirectory cleanup.
+    with closing(open_readonly(db_path)) as conn:
         tables = {
             row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
