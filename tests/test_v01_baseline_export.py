@@ -11,6 +11,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 MODULE = Path(__file__).resolve().parents[1] / "tools" / "export_v01_baseline_ids.py"
@@ -27,7 +28,7 @@ class V01BaselineExportTests(unittest.TestCase):
         self.db = self.dir / "state.sqlite3"
         self.out = self.dir / "baseline.json"
         self.ids = ["conv-" + str(i).zfill(8) for i in range(65)]
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.executescript("""
                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE conversations (
@@ -60,7 +61,7 @@ class V01BaselineExportTests(unittest.TestCase):
     def test_65_real_baseline_ids_only(self):
         # A synthetic increment and a modified existing version should not
         # leak into the frozen 65-chat historical cohort.
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "INSERT INTO conversations(workspace_id,conversation_id) VALUES (?,?)",
                 ("workspace-1", "conv-99999999")
@@ -84,7 +85,7 @@ class V01BaselineExportTests(unittest.TestCase):
             exporter.save_new(self.out, payload)
 
     def test_reject_incomplete_baseline(self):
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "DELETE FROM versions WHERE kind='baseline' AND conversation_id=?",
                 (self.ids[0],)
@@ -94,7 +95,7 @@ class V01BaselineExportTests(unittest.TestCase):
         self.assertFalse(self.out.exists())
 
     def test_reject_meta_count_mismatch(self):
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "UPDATE meta SET value='66' WHERE key='baseline_conversation_count'"
             )
@@ -102,7 +103,7 @@ class V01BaselineExportTests(unittest.TestCase):
             exporter.verify_baseline(self.db)
 
     def test_reject_missing_current_conversation(self):
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute(
                 "DELETE FROM conversations WHERE conversation_id=?", (self.ids[0],)
             )
