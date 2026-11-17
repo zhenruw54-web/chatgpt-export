@@ -560,6 +560,14 @@
         throw new Error(receipt?.error||'Browser ZIP completion was not verified; index unchanged.');
       checkCancelled();
       return receipt;
+    } catch (error) {
+      // If the anchor click throws or the task is cancelled, release the
+      // observer session. Never remove a user's downloaded ZIP.
+      if (token) {
+        try { await api.runtime.sendMessage({type:'cgx-v02-abort-zip',token}); }
+        catch (_) {}
+      }
+      throw error;
     } finally {
       // Do not revoke while downloading. Even a failed or timed-out job is
       // kept long enough for the browser to finish its own cleanup.
